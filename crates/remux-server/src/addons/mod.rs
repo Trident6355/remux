@@ -2301,6 +2301,23 @@ impl AddonService {
         ctx: &AppContext,
         config: &api::ServerConfiguration,
     ) -> Vec<db::Media> {
+        self.get_direct_children_settled(node, ctx, config)
+            .await
+            .0
+    }
+
+    /// `get_direct_children`, plus whether the answer is settled: no
+    /// higher-priority tree addon failed, timed out or was skipped for a rate
+    /// limit before it. Only a settled answer may remove children that are
+    /// missing from it; a fallback after an error may be shaped differently
+    /// only for as long as the error lasts.
+    async fn get_direct_children_settled(
+        &self,
+        node: &db::Media,
+        ctx: &AppContext,
+        config: &api::ServerConfiguration,
+    ) -> (Vec<db::Media>, bool) {
+        let mut settled = true;
         let fetch_timeout = config.addon_fetch_timeout();
         let applicable: Vec<Arc<dyn TreeAddon>> = self
             .inner
@@ -2356,6 +2373,7 @@ impl AddonService {
                     cooldown = ?cooldown,
                     "skipping tree fetch: shared rate limit cooldown exceeds timeout"
                 );
+                settled = false;
                 continue;
             }
             let result = tokio::time::timeout(
@@ -2374,13 +2392,16 @@ impl AddonService {
             match result {
                 Ok(Some(children)) if !children.is_empty() => {
                     debug!(children = children.len(), "get_direct_children fetched");
-                    return children;
+                    return (children, settled);
                 }
                 Ok(_) => continue,
-                Err(e) => debug!(error = %e, "get_children failed"),
+                Err(e) => {
+                    debug!(error = %e, "get_children failed");
+                    settled = false;
+                }
             }
         }
-        vec![]
+        (vec![], false)
     }
 
     /// Load a map of `(kind_str, idx) → existing_uuid` for all direct children
@@ -2625,8 +2646,8 @@ impl AddonService {
 
         // Level 1: direct children (Seasons, Albums, etc.) — see
         // `get_direct_children`'s own span for fetch timing.
-        let raw_level1 = self
-            .get_direct_children(&media, &ctx, &config)
+        let (raw_level1, level1_settled) = self
+            .get_direct_children_settled(&media, &ctx, &config)
             .await;
         if raw_level1.is_empty() {
             self.notify_series_done(&media);
@@ -2779,6 +2800,14 @@ impl AddonService {
         ))
         .await;
 
+        // What this walk wrote, per season: whether the season's episode list
+        // was settled (no higher-priority tree addon failed before it) and
+        // fully written, and the episode ids. Obsolete rows are only removed
+        // after a walk that was settled and complete everywhere: a fallback
+        // after an error may be shaped differently only while the error lasts.
+        let walk_ok = level1_settled && level1_ok.len() == level1.len();
+        let walked: Arc<std::sync::Mutex<Vec<(bool, Vec<Uuid>)>>> = Arc::default();
+
         // Level 2: grandchildren (Episodes, Tracks, etc.) — one fetch+upsert
         // per level-1 child. Only process children whose level-1 upsert
         // succeeded to avoid orphaned rows. Different seasons' episode
@@ -2797,6 +2826,7 @@ impl AddonService {
                 let semaphore = Arc::clone(&semaphore);
                 let gp_stub = gp_stub.clone();
                 let existing_l2 = &existing_l2;
+                let walked = Arc::clone(&walked);
                 async move {
                     // Created here (first poll), not synchronously in the
                     // `for_each_concurrent` closure — a season stuck waiting
@@ -2806,10 +2836,14 @@ impl AddonService {
                     let child_span = tracing::debug_span!(target: "remux_server::metadata_refresh", "grandchildren", child_id = %child.id);
                     async move {
                     let actual_child_id = child.id;
-                    let raw_level2 = svc
-                        .get_direct_children(child, &ctx, &config)
+                    let (raw_level2, level2_settled) = svc
+                        .get_direct_children_settled(child, &ctx, &config)
                         .await;
                     if raw_level2.is_empty() {
+                        walked
+                            .lock()
+                            .unwrap()
+                            .push((false, vec![]));
                         return;
                     }
 
@@ -2871,15 +2905,23 @@ impl AddonService {
                     .await;
 
                     async {
+                        let mut written = Vec::with_capacity(level2.len());
+                        let mut all_written = true;
                         for chunk in level2.chunks(db::CHUNK_SIZE) {
                             if let Err(e) = db::Media::upsert(&ctx.db, chunk).await {
                                 error!(error = %e, "failed to upsert grandchildren");
+                                all_written = false;
                             } else {
                                 db::UserMediaState::remap_orphaned_for(&ctx.db, chunk).await;
                                 save_pending_relations(&ctx, chunk).await;
                                 save_pending_tags(&ctx, chunk).await;
+                                written.extend(chunk.iter().map(|gc| gc.id));
                             }
                         }
+                        walked
+                            .lock()
+                            .unwrap()
+                            .push((level2_settled && all_written, written));
                     }
                     .instrument(tracing::debug_span!(target: "remux_server::metadata_refresh", "grandchildren_upsert", grandchildren = level2.len()))
                     .await;
@@ -2889,6 +2931,47 @@ impl AddonService {
                 }
             })
             .await;
+
+        let walked = std::mem::take(
+            &mut *walked
+                .lock()
+                .unwrap(),
+        );
+        if media.kind == db::MediaKind::Series
+            && walk_ok
+            && walked
+                .iter()
+                .all(|(complete, _)| *complete)
+        {
+            let walk = db::SeriesTreeWalk {
+                seasons: level1
+                    .iter()
+                    .map(|c| c.id)
+                    .collect(),
+                episodes: walked
+                    .into_iter()
+                    .flat_map(|(_, ids)| ids)
+                    .collect(),
+            };
+            let mut root = media.clone();
+            root.id = actual_root_id;
+            match db::Media::remove_obsolete_series_children(&ctx.db, &root, &walk)
+                .await
+            {
+                Ok((0, 0, _)) => {}
+                Ok((seasons, episodes, moved)) => info!(
+                    id = %actual_root_id,
+                    title = %media.title,
+                    seasons,
+                    episodes,
+                    moved_watch_state = moved,
+                    "removed obsolete seasons/episodes"
+                ),
+                Err(e) => {
+                    warn!(id = %actual_root_id, error = %e, "failed to remove obsolete seasons/episodes")
+                }
+            }
+        }
 
         self.notify_series_done(&media);
         actual_root_id
@@ -4376,6 +4459,359 @@ mod tests {
         };
         apply_title_format(&mut media);
         assert_eq!(media.title, "Tumbleton");
+    }
+
+    /// Jellyfin's rules for obsolete episodes (`RemoveObsoleteEpisodes`),
+    /// with the episodes a refresh wrote as the present ones. The metadata
+    /// source now lists TVDB episode 103 as S2E1; what an older list left:
+    /// - S1E3, the same episode (TVDB 103, unique in the series): removed,
+    ///   its watch state moves to S2E1
+    /// - an episode without a number: removed
+    /// - S1E9 (TVDB 999), only missing from the list: kept
+    /// - S1E8 (TVDB 101), whose id two listed episodes share: kept
+    /// - season 3 with its missing S3E1: kept; empty season 4: removed
+    #[tokio::test]
+    async fn refresh_removes_only_episodes_that_are_present_under_another_number() {
+        let (after, watched, s2e1, _) = relisted_series_cleanup(Lock::None).await;
+        assert_eq!(
+            after,
+            vec![
+                ("season".to_string(), None, Some(1)),
+                ("season".to_string(), None, Some(2)),
+                ("season".to_string(), None, Some(3)),
+                ("episode".to_string(), Some(1), Some(1)),
+                ("episode".to_string(), Some(1), Some(2)),
+                ("episode".to_string(), Some(1), Some(8)),
+                ("episode".to_string(), Some(1), Some(9)),
+                ("episode".to_string(), Some(2), Some(1)),
+                ("episode".to_string(), Some(3), Some(1)),
+            ]
+        );
+        assert_eq!(
+            watched,
+            vec![(s2e1, Some("episode:tt7000002:2:1".to_string()))]
+        );
+    }
+
+    /// The same, with the old S1E3 and the empty season 4 locked by the
+    /// admin: both stay, with S1E3's watch state; the rest is cleaned up.
+    #[tokio::test]
+    async fn refresh_keeps_locked_episodes_and_seasons() {
+        let (after, watched, _, old_s1e3) = relisted_series_cleanup(Lock::Items).await;
+        assert_eq!(
+            after,
+            vec![
+                ("season".to_string(), None, Some(1)),
+                ("season".to_string(), None, Some(2)),
+                ("season".to_string(), None, Some(3)),
+                ("season".to_string(), None, Some(4)),
+                ("episode".to_string(), Some(1), Some(1)),
+                ("episode".to_string(), Some(1), Some(2)),
+                ("episode".to_string(), Some(1), Some(3)),
+                ("episode".to_string(), Some(1), Some(8)),
+                ("episode".to_string(), Some(1), Some(9)),
+                ("episode".to_string(), Some(2), Some(1)),
+                ("episode".to_string(), Some(3), Some(1)),
+            ]
+        );
+        assert_eq!(watched, vec![(old_s1e3, None)]);
+    }
+
+    /// A locked series protects all its seasons and episodes from removal.
+    #[tokio::test]
+    async fn refresh_removes_nothing_of_a_locked_series() {
+        let (after, watched, _, old_s1e3) = relisted_series_cleanup(Lock::Series).await;
+        assert_eq!(
+            after,
+            vec![
+                ("season".to_string(), None, Some(1)),
+                ("season".to_string(), None, Some(2)),
+                ("season".to_string(), None, Some(3)),
+                ("season".to_string(), None, Some(4)),
+                ("episode".to_string(), Some(1), None),
+                ("episode".to_string(), Some(1), Some(1)),
+                ("episode".to_string(), Some(1), Some(2)),
+                ("episode".to_string(), Some(1), Some(3)),
+                ("episode".to_string(), Some(1), Some(8)),
+                ("episode".to_string(), Some(1), Some(9)),
+                ("episode".to_string(), Some(2), Some(1)),
+                ("episode".to_string(), Some(3), Some(1)),
+            ]
+        );
+        assert_eq!(watched, vec![(old_s1e3, None)]);
+    }
+
+    #[derive(PartialEq)]
+    enum Lock {
+        None,
+        Items,
+        Series,
+    }
+
+    /// A series whose metadata source lists its episodes anew, with rows an
+    /// older list left behind (see the tests above). Returns the layout after
+    /// the second refresh, the watch state, and the ids of S2E1 and old S1E3.
+    async fn relisted_series_cleanup(
+        lock: Lock,
+    ) -> (
+        Vec<(String, Option<i64>, Option<i64>)>,
+        Vec<(Uuid, Option<String>)>,
+        Uuid,
+        Uuid,
+    ) {
+        let meta = httpmock::MockServer::start();
+        // Own path: the HTTP response cache is process-wide and keyed by URL,
+        // and a parallel test run reuses mock servers' ports.
+        let meta_prefix = format!("/{}", Uuid::new_v4().simple());
+        meta.mock(|when, then| {
+            when.path(format!("{meta_prefix}/manifest.json"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": "meta-test", "name": "Meta", "version": "1.0.0",
+                    "resources": ["meta"], "types": ["series"], "idPrefixes": ["tt"], "catalogs": []
+                }));
+        });
+        let video = |s: i64, e: i64, tvdb: i64| {
+            serde_json::json!({ "id": format!("tt7000002:{s}:{e}"), "name": format!("Ep {s}x{e}"),
+                                "season": s, "episode": e, "tvdb_id": tvdb })
+        };
+        meta.mock(|when, then| {
+            when.path(format!("{meta_prefix}/meta/series/tt7000002.json"));
+            then.status(200)
+                .json_body(serde_json::json!({ "meta": {
+                    "id": "tt7000002", "type": "series", "name": "Show",
+                    "videos": [video(1, 1, 101), video(1, 2, 101), video(2, 1, 103)]
+                }}));
+        });
+
+        let (_server, guard) =
+            crate::integration_test::new_test_server_with_config(crate::Config {
+                database_url: Some("sqlite::memory:".into()),
+                torrent_http_port: None,
+                disable_dht: true,
+                // TMDB must not answer: the tree comes from the meta addon only.
+                tmdb_base_url: meta.base_url(),
+                // No background library refresh racing the rows planted below.
+                disable_startup_tasks: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        // A busy test run must not turn a mock's slow answer into a fallback,
+        // which (correctly) skips the cleanup this test is about.
+        let mut config = db::Settings::get_config_or_default(&ctx.db).await;
+        config.addon_fetch_timeout_secs = Some(60);
+        db::Settings::set_config(&ctx.db, &config)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().naive_utc();
+        addon::Addon {
+            id: Uuid::new_v4(),
+            name: "Meta".into(),
+            preset: serde_json::from_value(serde_json::json!({
+                "kind": "stremio",
+                "config": { "manifest_url": format!("{}{meta_prefix}/manifest.json", meta.base_url()) }
+            }))
+            .unwrap(),
+            resources: vec![ResourceType::Meta],
+            types: vec![],
+            enabled: true,
+            priority: -1,
+            created_at: now,
+            updated_at: now,
+            system: false,
+            is_default: true,
+            http_redirect_stream: false,
+            subtitle_extraction: false,
+            probe_on_scan: false,
+            service_filter: vec![],
+        }
+        .insert(&ctx.db)
+        .await
+        .unwrap();
+        ctx.addons
+            .reload(&ctx.db, &ctx.config)
+            .await
+            .unwrap();
+
+        let mut series = db::Media {
+            id: Uuid::new_v4(),
+            kind: db::MediaKind::Series,
+            title: "Show".into(),
+            external_ids: db::ExternalIds {
+                imdb: db::NonEmptyString::try_new("tt7000002").ok(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        series
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        // Refresh the series as stored, as a library refresh does (with the
+        // lock, once set).
+        let refresh = || async {
+            let stored = db::Media::get_by_id(&ctx.db, &series.id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| series.clone());
+            ctx.addons
+                .process_meta_batch(vec![stored], ctx, true, None)
+                .await
+                .unwrap()[&series.id]
+        };
+        let layout = |series_id: Uuid| async move {
+            sqlx::query_as::<_, (String, Option<i64>, Option<i64>, Uuid)>(
+                "SELECT CAST(kind AS TEXT), parent_idx, idx, id FROM media \
+                 WHERE grandparent_id = ? AND kind IN ('season', 'episode') \
+                 ORDER BY kind DESC, parent_idx, idx",
+            )
+            .bind(series_id)
+            .fetch_all(&ctx.db)
+            .await
+            .unwrap()
+        };
+
+        let series_id = refresh().await;
+        let current = layout(series_id).await;
+        let season1 = current
+            .iter()
+            .find(|r| r.0 == "season" && r.2 == Some(1))
+            .unwrap()
+            .3;
+        let s2e1 = current
+            .iter()
+            .find(|r| r.0 == "episode" && r.1 == Some(2))
+            .unwrap()
+            .3;
+
+        let key = series.series_canonical_key();
+        let left_behind = |id: Uuid,
+                           kind: db::MediaKind,
+                           parent: Uuid,
+                           s: Option<i64>,
+                           e: Option<i64>,
+                           tvdb: Option<i64>| db::Media {
+            id,
+            kind,
+            title: "old".into(),
+            parent_id: Some(parent),
+            grandparent_id: Some(series_id),
+            parent_idx: s,
+            idx: e,
+            external_ids: db::ExternalIds {
+                tvdb,
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        let season3 = db::Media::season_id(&key, 3);
+        let season4 = db::Media::season_id(&key, 4);
+        let old_s1e3 = db::Media::episode_id(&key, 1, 3);
+        let mut old = vec![
+            left_behind(
+                season3,
+                db::MediaKind::Season,
+                series_id,
+                None,
+                Some(3),
+                None,
+            ),
+            left_behind(
+                season4,
+                db::MediaKind::Season,
+                series_id,
+                None,
+                Some(4),
+                None,
+            ),
+            left_behind(
+                old_s1e3,
+                db::MediaKind::Episode,
+                season1,
+                Some(1),
+                Some(3),
+                Some(103),
+            ),
+            left_behind(
+                db::Media::episode_id(&key, 1, 8),
+                db::MediaKind::Episode,
+                season1,
+                Some(1),
+                Some(8),
+                Some(101),
+            ),
+            left_behind(
+                db::Media::episode_id(&key, 1, 9),
+                db::MediaKind::Episode,
+                season1,
+                Some(1),
+                Some(9),
+                Some(999),
+            ),
+            left_behind(
+                db::Media::episode_id(&key, 3, 1),
+                db::MediaKind::Episode,
+                season3,
+                Some(3),
+                Some(1),
+                Some(998),
+            ),
+        ];
+        for m in old.iter_mut() {
+            m.is_locked = lock == Lock::Items && (m.id == old_s1e3 || m.id == season4);
+            m.save(&ctx.db)
+                .await
+                .unwrap();
+        }
+        if lock == Lock::Series {
+            sqlx::query("UPDATE media SET is_locked = 1 WHERE id = ?")
+                .bind(series_id)
+                .execute(&ctx.db)
+                .await
+                .unwrap();
+        }
+        // Saving refuses an episode without a number; older rows can have one.
+        sqlx::query(
+            "INSERT INTO media (id, title, kind, parent_id, grandparent_id, parent_idx, external_ids, created_at, updated_at) \
+             VALUES (?, 'old', 'episode', ?, ?, 1, '{}', ?, ?)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(season1)
+        .bind(series_id)
+        .bind(now)
+        .bind(now)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+        let user = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO user_media_state (user_id, media_id, play_count, playback_position) VALUES (?, ?, 1, 0)",
+        )
+        .bind(user)
+        .bind(old_s1e3)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+
+        assert_eq!(refresh().await, series_id);
+
+        let after: Vec<(String, Option<i64>, Option<i64>)> = layout(series_id)
+            .await
+            .into_iter()
+            .map(|(k, s, e, _)| (k, s, e))
+            .collect();
+        let watched: Vec<(Uuid, Option<String>)> = sqlx::query_as(
+            "SELECT media_id, media_raw FROM user_media_state WHERE user_id = ?",
+        )
+        .bind(user)
+        .fetch_all(&ctx.db)
+        .await
+        .unwrap();
+        (after, watched, s2e1, old_s1e3)
     }
 
     #[test]
