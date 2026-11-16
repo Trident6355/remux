@@ -1918,46 +1918,67 @@ async fn fetch_tmdb_meta(
                 // Borrow the cached season rather than taking it by value: this runs
                 // once per episode, and copying every episode's overview/credits/
                 // guest stars just to read one of them is quadratic per season.
-                let season = client
-                    .execute_arc(
-                        sdks::tmdb::SeasonEndpoint {
-                            series_id: tmdb_id,
-                            season_number: s_n,
-                            language: config
-                                .preferred_metadata_language
-                                .clone(),
-                            append_to_response: None,
-                        }
-                        .with_cache(Duration::from_secs(360)),
-                    )
-                    .await?;
-                let Some(ep) = season
-                    .episodes
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .find(|e| e.episode_number == e_n)
-                else {
-                    return Ok(None);
-                };
                 let language = config
                     .preferred_metadata_language
                     .as_deref();
+                // A season TMDB doesn't have (the episode list came from another
+                // source that splits TMDB's season) is not an error here.
+                let season = tmdb_cached_season(
+                    &client,
+                    tmdb_id,
+                    s_n,
+                    language.map(str::to_string),
+                )
+                .await?;
+                let by_number = season
+                    .as_deref()
+                    .and_then(|s| {
+                        s.episodes
+                            .as_deref()
+                    })
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|e| e.episode_number == e_n)
+                    .filter(|ep| is_same_tmdb_episode(ep, media));
+                // The episode list came from a source that numbers episodes
+                // differently (Cinemeta/IMDb splits seasons TMDB keeps as one,
+                // or parts TMDB merges): TMDB's episode at this number is
+                // another episode, or there is none. Find TMDB's own episode
+                // by the TVDB id that source gave us; the numbering stays the
+                // list's.
+                let (ep, renumbered) = match by_number {
+                    Some(ep) => (std::borrow::Cow::Borrowed(ep), false),
+                    None => match tmdb_episode_by_tvdb(
+                        &client,
+                        tmdb_id,
+                        media,
+                        language.map(str::to_string),
+                    )
+                    .await?
+                    {
+                        Some(ep) => (std::borrow::Cow::Owned(ep), true),
+                        None => return Ok(None),
+                    },
+                };
                 let original_language =
-                    if tmdb_episode_may_be_untranslated(ep, language) {
+                    if tmdb_episode_may_be_untranslated(&ep, language) {
                         stored_series_original_language(media, ctx).await
                     } else {
                         None
                     };
-                return tmdb_episode_meta(
+                let mut patch = tmdb_episode_meta(
                     &client,
                     tmdb_id,
-                    ep,
+                    &ep,
                     language,
                     original_language.as_deref(),
                 )
-                .await
-                .map(Some);
+                .await?;
+                if renumbered {
+                    patch.idx = None;
+                    patch.parent_idx = None;
+                }
+                return Ok(Some(patch));
             }
         }
         db::MediaKind::Season => {
@@ -2032,6 +2053,108 @@ async fn fetch_tmdb_meta(
     }
 
     Ok(None)
+}
+
+/// A TMDB season from the shared cache; `None` when TMDB has no such season.
+async fn tmdb_cached_season(
+    client: &sdks::RestClient<sdks::BearerAuth>,
+    series_id: i64,
+    season_number: i64,
+    language: Option<String>,
+) -> Result<Option<Arc<sdks::tmdb::Season>>> {
+    match client
+        .execute_arc(
+            sdks::tmdb::SeasonEndpoint {
+                series_id,
+                season_number,
+                language,
+                append_to_response: None,
+            }
+            .with_cache(Duration::from_secs(360)),
+        )
+        .await
+    {
+        Ok(season) => Ok(Some(season)),
+        Err(e) => {
+            let e = anyhow::Error::from(e);
+            if is_404(&e) { Ok(None) } else { Err(e) }
+        }
+    }
+}
+
+/// Whether TMDB's episode at our number is the episode we have: it carries
+/// our TMDB episode id, or their air dates agree within a day (time zones),
+/// or one side has no date to compare.
+fn is_same_tmdb_episode(ep: &sdks::tmdb::Episode, media: &db::Media) -> bool {
+    if media
+        .external_ids
+        .tmdb
+        == Some(ep.id)
+    {
+        return true;
+    }
+    match (
+        ep.air_date,
+        media
+            .released_at
+            .map(|d| d.date()),
+    ) {
+        (Some(a), Some(b)) => {
+            (a - b)
+                .num_days()
+                .abs()
+                <= 1
+        }
+        _ => true,
+    }
+}
+
+/// TMDB's episode with the TVDB episode id the episode list gave us, read
+/// from TMDB's season (cached, in the metadata language). `None` without a
+/// TVDB id or when TMDB doesn't know it for this series.
+async fn tmdb_episode_by_tvdb(
+    client: &sdks::RestClient<sdks::BearerAuth>,
+    series_tmdb_id: i64,
+    media: &db::Media,
+    language: Option<String>,
+) -> Result<Option<sdks::tmdb::Episode>> {
+    let Some(tvdb) = media
+        .external_ids
+        .tvdb
+    else {
+        return Ok(None);
+    };
+    let found = client
+        .execute_arc(
+            sdks::tmdb::FindByIdEndpoint {
+                external_id: tvdb.to_string(),
+                external_source: "tvdb_id".to_string(),
+            }
+            .with_cache(Duration::from_secs(86400)),
+        )
+        .await?;
+    let Some(hit) = found
+        .tv_episode_results
+        .iter()
+        .find(|e| {
+            e.show_id
+                .is_none_or(|id| id == series_tmdb_id)
+        })
+    else {
+        return Ok(None);
+    };
+    let season =
+        tmdb_cached_season(client, series_tmdb_id, hit.season_number, language).await?;
+    Ok(season
+        .as_deref()
+        .and_then(|s| {
+            s.episodes
+                .as_deref()
+        })
+        .unwrap_or_default()
+        .iter()
+        .find(|e| e.episode_number == hit.episode_number)
+        .cloned())
 }
 
 async fn fetch_tmdb_season_meta(
@@ -2819,6 +2942,9 @@ mod tests {
             torrent_http_port: None,
             disable_dht: true,
             tmdb_base_url: mock.base_url(),
+            // As in `new_test_server`: no startup catalog import or library
+            // refresh running against the mock while a test is.
+            disable_startup_tasks: true,
             ..Default::default()
         })
         .await
@@ -3224,5 +3350,354 @@ mod tests {
                 ("Hinter den Kulissen".to_string(), Some("de".to_string())),
             ]
         );
+    }
+
+    type EpisodeRow = (
+        Option<i64>,
+        Option<i64>,
+        String,
+        Option<String>,
+        Option<i64>,
+    );
+
+    /// Cinemeta (ranked above TMDB) gives Re:Zero IMDb's seasons, which is
+    /// also how stream addons number episodes; TMDB keeps them in one season
+    /// (IMDb S2E1 = TMDB S1E2 here). Returns the episodes (season, number,
+    /// title, overview, TMDB id) and the series as the last row.
+    async fn rezero_with_cinemeta(
+        cinemeta_language: Option<&str>,
+        preferred_language: Option<&str>,
+    ) -> Vec<EpisodeRow> {
+        let cinemeta = httpmock::MockServer::start();
+        // Own path: the HTTP response cache is process-wide and keyed by URL,
+        // and a parallel test run reuses mock servers' ports.
+        let cinemeta_prefix = format!("/{}", Uuid::new_v4().simple());
+        cinemeta.mock(|when, then| {
+            when.path(format!("{cinemeta_prefix}/manifest.json"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": "cinemeta-test", "name": "Cinemeta", "version": "1.0.0",
+                    "resources": ["meta"], "types": ["series"], "idPrefixes": ["tt"], "catalogs": []
+                }));
+        });
+        cinemeta.mock(|when, then| {
+            when.path(format!("{cinemeta_prefix}/meta/series/tt5607616.json"));
+            then.status(200)
+                .json_body(serde_json::json!({ "meta": {
+                    "id": "tt5607616", "type": "series", "name": "Re:ZERO",
+                    "description": "English overview.",
+                    "videos": [
+                        { "id": "tt5607616:0:1", "name": "Inside Re:ZERO", "season": 0, "episode": 1,
+                          "overview": "A look behind.", "released": "2016-12-01T00:00:00.000Z", "tvdb_id": 5637300 },
+                        { "id": "tt5607616:1:1", "name": "The End of the Beginning", "season": 1, "episode": 1,
+                          "overview": "Subaru arrives.", "released": "2016-04-04T00:00:00.000Z", "tvdb_id": 5637311 },
+                        { "id": "tt5607616:2:1", "name": "Each One's Promise", "season": 2, "episode": 1,
+                          "overview": "Subaru wakes up.", "released": "2020-07-08T00:00:00.000Z", "tvdb_id": 7546792 }
+                    ]
+                }}));
+        });
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/tv/65942");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": 65942, "name": "Re:ZERO DE", "overview": "Deutsche Beschreibung.",
+                    "original_language": "ja",
+                    "seasons": [{ "id": 77001, "season_number": 1, "name": "Staffel 1", "episode_count": 2 }]
+                }));
+        });
+        tmdb.mock(|when, then| {
+            when.path("/tv/65942/season/0");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": 77000, "season_number": 0, "name": "Specials",
+                    "episodes": [
+                        { "id": 1176800, "name": "Folge 1", "season_number": 0, "episode_number": 1,
+                          "overview": "", "air_date": "2016-12-01" }
+                    ]
+                }));
+        });
+        tmdb.mock(|when, then| {
+            when.path("/tv/65942/season/0/episode/1/translations");
+            then.status(200)
+                .json_body(translations(&[
+                    ("de", "DE", "", ""),
+                    ("en", "US", "Inside Re:ZERO (TMDB)", "Behind the scenes."),
+                ]));
+        });
+        tmdb.mock(|when, then| {
+            when.path("/tv/65942/season/1");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": 77001, "season_number": 1, "name": "Staffel 1",
+                    "episodes": [
+                        { "id": 1176875, "name": "Das Ende vom Anfang", "season_number": 1, "episode_number": 1,
+                          "overview": "Subaru kommt an.", "air_date": "2016-04-04" },
+                        { "id": 4319552, "name": "Verschiedene Versprechen", "season_number": 1, "episode_number": 2,
+                          "overview": "Subaru wacht auf.", "air_date": "2020-07-08" }
+                    ]
+                }));
+        });
+        tmdb_not_found(&tmdb, "/tv/65942/season/2");
+        tmdb.mock(|when, then| {
+            when.path("/find/7546792")
+                .query_param("external_source", "tvdb_id");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "tv_episode_results": [{ "id": 4319552, "name": "Each One's Promise", "show_id": 65942,
+                                             "season_number": 1, "episode_number": 2 }]
+                }));
+        });
+
+        let guard = ctx_with_tmdb(&tmdb).await;
+        let ctx = &guard.0;
+        let mut config = db::Settings::get_config_or_default(&ctx.db).await;
+        config.preferred_metadata_language = preferred_language.map(str::to_string);
+        // A busy test run must not turn a mock's slow answer into a fallback.
+        config.addon_fetch_timeout_secs = Some(60);
+        db::Settings::set_config(&ctx.db, &config)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().naive_utc();
+        let mut addon_cfg = serde_json::json!({
+            "manifest_url": format!("{}{cinemeta_prefix}/manifest.json", cinemeta.base_url())
+        });
+        if let Some(language) = cinemeta_language {
+            addon_cfg["language"] = language.into();
+        }
+        crate::addons::Addon {
+            id: Uuid::new_v4(),
+            name: "Cinemeta".into(),
+            preset: serde_json::from_value(
+                serde_json::json!({ "kind": "stremio", "config": addon_cfg }),
+            )
+            .unwrap(),
+            resources: vec![remux_sdks::stremio::ResourceType::Meta],
+            types: vec![],
+            enabled: true,
+            priority: -1,
+            created_at: now,
+            updated_at: now,
+            system: false,
+            is_default: true,
+            http_redirect_stream: false,
+            subtitle_extraction: false,
+            probe_on_scan: false,
+            service_filter: vec![],
+        }
+        .insert(&ctx.db)
+        .await
+        .unwrap();
+        ctx.addons
+            .reload(&ctx.db, &ctx.config)
+            .await
+            .unwrap();
+
+        let mut series = db::Media {
+            id: Uuid::new_v4(),
+            kind: db::MediaKind::Series,
+            title: "Re:ZERO".into(),
+            external_ids: db::ExternalIds {
+                tmdb: Some(65942),
+                imdb: db::NonEmptyString::try_new("tt5607616").ok(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        series
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        let ids = ctx
+            .addons
+            .process_meta_batch(vec![series.clone()], ctx, false, None)
+            .await
+            .unwrap();
+        let series_id = ids[&series.id];
+
+        let mut rows: Vec<EpisodeRow> = sqlx::query_as(
+            "SELECT parent_idx, idx, title, description, CAST(json_extract(external_ids, '$.tmdb') AS INTEGER) \
+             FROM media WHERE kind = 'episode' AND grandparent_id = ? ORDER BY parent_idx, idx",
+        )
+        .bind(series_id)
+        .fetch_all(&ctx.db)
+        .await
+        .unwrap();
+        let stored = db::Media::get_by_id(&ctx.db, &series_id)
+            .await
+            .unwrap()
+            .unwrap();
+        rows.push((None, None, stored.title, stored.description, None));
+        rows
+    }
+
+    fn row(
+        season: Option<i64>,
+        number: Option<i64>,
+        title: &str,
+        overview: &str,
+        tmdb: Option<i64>,
+    ) -> EpisodeRow {
+        (season, number, title.into(), Some(overview.into()), tmdb)
+    }
+
+    /// With German as metadata language and the Cinemeta addon marked as
+    /// English, overviews are only a fallback (Jellyfin's rule) and TMDB's
+    /// German overview replaces them; TMDB finds its own episode by TVDB id
+    /// where it numbers it differently. Titles and numbering stay Cinemeta's.
+    /// Where TMDB has no German text (the special), Cinemeta's stays.
+    #[tokio::test]
+    async fn english_addon_overviews_give_way_to_tmdb_in_the_metadata_language() {
+        assert_eq!(
+            rezero_with_cinemeta(Some("en"), Some("de")).await,
+            vec![
+                row(
+                    Some(0),
+                    Some(1),
+                    "Inside Re:ZERO",
+                    "A look behind.",
+                    Some(1176800)
+                ),
+                row(
+                    Some(1),
+                    Some(1),
+                    "The End of the Beginning",
+                    "Subaru kommt an.",
+                    Some(1176875)
+                ),
+                row(
+                    Some(2),
+                    Some(1),
+                    "Each One's Promise",
+                    "Subaru wacht auf.",
+                    Some(4319552)
+                ),
+                row(None, None, "Re:ZERO", "Deutsche Beschreibung.", None),
+            ]
+        );
+    }
+
+    /// Without a language on the addon nothing changes from before.
+    #[tokio::test]
+    async fn addon_without_a_language_keeps_todays_behavior() {
+        assert_eq!(
+            rezero_with_cinemeta(None, Some("de")).await,
+            vec![
+                row(Some(0), Some(1), "Inside Re:ZERO", "A look behind.", None),
+                row(
+                    Some(1),
+                    Some(1),
+                    "The End of the Beginning",
+                    "Subaru arrives.",
+                    None
+                ),
+                row(
+                    Some(2),
+                    Some(1),
+                    "Each One's Promise",
+                    "Subaru wakes up.",
+                    None
+                ),
+                row(None, None, "Re:ZERO", "English overview.", None),
+            ]
+        );
+    }
+
+    /// No metadata language configured: every result matches, nothing is a
+    /// fallback, the addon priority decides as before.
+    #[tokio::test]
+    async fn no_metadata_language_keeps_the_addon_priority() {
+        assert_eq!(
+            rezero_with_cinemeta(Some("en"), None).await,
+            rezero_with_cinemeta(None, Some("de")).await
+        );
+    }
+
+    /// TMDB numbers an episode the addon's list has elsewhere: its episode is
+    /// found by TVDB id and the numbering stays the list's.
+    #[tokio::test]
+    async fn tmdb_episode_meta_follows_the_tvdb_id_when_numbers_differ() {
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/tv/65943/season/1");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": 77001, "season_number": 1, "name": "Staffel 1",
+                    "episodes": [
+                        { "id": 4319552, "name": "Verschiedene Versprechen", "season_number": 1, "episode_number": 26,
+                          "overview": "Subaru wacht auf.", "air_date": "2020-07-08" }
+                    ]
+                }));
+        });
+        tmdb_not_found(&tmdb, "/tv/65943/season/2");
+        tmdb.mock(|when, then| {
+            when.path("/find/7546799");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "tv_episode_results": [{ "id": 4319552, "name": "x", "show_id": 65943,
+                                             "season_number": 1, "episode_number": 26 }]
+                }));
+        });
+        let guard = ctx_with_tmdb(&tmdb).await;
+        let series = Arc::new(db::Media {
+            kind: db::MediaKind::Series,
+            external_ids: db::ExternalIds {
+                tmdb: Some(65943),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let episode = db::Media {
+            kind: db::MediaKind::Episode,
+            parent_idx: Some(2),
+            idx: Some(1),
+            released_at: chrono::NaiveDate::from_ymd_opt(2020, 7, 8)
+                .and_then(|d| d.and_hms_opt(0, 0, 0)),
+            external_ids: db::ExternalIds {
+                tvdb: Some(7546799),
+                ..Default::default()
+            },
+            grandparent: Some(series),
+            ..Default::default()
+        };
+        let patch = TmdbAddon
+            .meta_fetch(&episode, &guard.0, &Default::default())
+            .await
+            .unwrap()
+            .expect("patch");
+        assert_eq!(patch.title, "Verschiedene Versprechen");
+        assert_eq!(
+            patch
+                .external_ids
+                .tmdb,
+            Some(4319552)
+        );
+        assert_eq!((patch.parent_idx, patch.idx), (None, None));
+    }
+
+    /// TMDB's episode at our number with our TMDB id is ours, even when TMDB
+    /// has since moved its air date.
+    #[test]
+    fn an_episode_with_our_tmdb_id_is_ours_whatever_its_air_date() {
+        let ep = sdks::tmdb::Episode {
+            id: 42,
+            air_date: chrono::NaiveDate::from_ymd_opt(2024, 1, 10),
+            ..Default::default()
+        };
+        let mut media = db::Media {
+            released_at: chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+                .and_then(|d| d.and_hms_opt(0, 0, 0)),
+            ..Default::default()
+        };
+        assert!(!is_same_tmdb_episode(&ep, &media));
+        media
+            .external_ids
+            .tmdb = Some(42);
+        assert!(is_same_tmdb_episode(&ep, &media));
+        media.released_at = None;
+        media
+            .external_ids
+            .tmdb = None;
+        assert!(is_same_tmdb_episode(&ep, &media));
     }
 }

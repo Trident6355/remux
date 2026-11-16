@@ -881,13 +881,14 @@ mod test {
             .iter()
             .find(|k| k.id == "stremio")
             .unwrap();
-        assert_eq!(
-            stremio
-                .options
-                .len(),
-            1
-        );
-        assert_eq!(stremio.options[0].id, "manifest_url");
+        let option_ids: Vec<&str> = stremio
+            .options
+            .iter()
+            .map(|o| {
+                o.id.as_str()
+            })
+            .collect();
+        assert_eq!(option_ids, ["manifest_url", "language"]);
     }
 
     #[tokio::test]

@@ -515,6 +515,28 @@ pub(crate) fn merge_media(target: &mut db::Media, source: &db::Media, replace: b
     }
 }
 
+/// Jellyfin's `MetadataLanguageUtils.MatchesPreferredLanguage`: a result is
+/// in the preferred language when either language is unknown or their
+/// language subtags agree ("de" matches "de-DE").
+pub(crate) fn matches_preferred_language(
+    result: Option<&str>,
+    preferred: Option<&str>,
+) -> bool {
+    let subtag = |l: &str| {
+        l.split('-')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    };
+    match (
+        result.filter(|l| !l.is_empty()),
+        preferred.filter(|l| !l.is_empty()),
+    ) {
+        (Some(r), Some(p)) => subtag(r) == subtag(p),
+        _ => true,
+    }
+}
+
 /// Default display title for a season: Jellyfin calls season 0 "Specials"
 /// (a per-library-configurable name there; a fixed default here).
 pub(crate) fn season_title(idx: i64) -> String {
@@ -876,6 +898,13 @@ pub trait MetaAddon: Send + Sync {
     /// and never gets a chance to remember the failure — this is the only
     /// place that can tell the addon a timeout happened for `media`.
     fn on_meta_fetch_timeout(&self, _media: &db::Media) {}
+    /// The language this addon's metadata is in, when known: the language of
+    /// a `meta_fetch` result that doesn't report one itself (Jellyfin's
+    /// `MetadataResult.ResultLanguage`). `None` counts as the preferred
+    /// language, as in Jellyfin.
+    fn result_language(&self) -> Option<&str> {
+        None
+    }
     /// Time left before this addon's shared upstream cooldown (see
     /// `SharedRateLimit`) clears, or `Duration::ZERO` if it has none or isn't
     /// currently blocked. `refresh_meta` checks this before starting a
@@ -2086,6 +2115,15 @@ impl AddonService {
         // untouched until the combined result is applied once at the end,
         // where `force_refresh` controls whether existing values are replaced.
         let mut combined: Option<db::Media> = None;
+        // Like Jellyfin's `MetadataService.ExecuteRemoteProviders`: an
+        // overview taken from a result in another language than the preferred
+        // one is only a fallback, and a later (lower-priority) result in the
+        // preferred language replaces it. A result that reports no language
+        // counts as matching, so nothing changes for addons that don't say.
+        let preferred_language = config
+            .preferred_metadata_language
+            .as_deref();
+        let mut overview_is_fallback = false;
         for (r, result) in applicable
             .iter()
             .zip(results)
@@ -2093,6 +2131,31 @@ impl AddonService {
             match result {
                 Ok(Some(patch)) => {
                     let acc = combined.get_or_insert_with(db::Media::default);
+                    let result_language = patch
+                        .result_language
+                        .as_deref()
+                        .or_else(|| {
+                            r.meta
+                                .as_ref()
+                                .and_then(|m| m.result_language())
+                        });
+                    if matches_preferred_language(result_language, preferred_language) {
+                        if overview_is_fallback
+                            && patch
+                                .description
+                                .is_some()
+                        {
+                            acc.description = None;
+                            overview_is_fallback = false;
+                        }
+                    } else {
+                        overview_is_fallback |= acc
+                            .description
+                            .is_none()
+                            && patch
+                                .description
+                                .is_some();
+                    }
                     apply_meta(acc, patch, false);
                 }
                 Ok(None) => {}
@@ -4387,6 +4450,17 @@ mod tests {
         };
         apply_title_format(&mut media);
         assert_eq!(media.title, "Tumbleton");
+    }
+
+    #[test]
+    fn preferred_language_matches_like_jellyfin() {
+        assert!(matches_preferred_language(Some("de"), Some("de-DE")));
+        assert!(matches_preferred_language(Some("DE-at"), Some("de")));
+        assert!(!matches_preferred_language(Some("en"), Some("de")));
+        // Unknown on either side: assume the request was honored.
+        assert!(matches_preferred_language(None, Some("de")));
+        assert!(matches_preferred_language(Some(""), Some("de")));
+        assert!(matches_preferred_language(Some("en"), None));
     }
 
     #[test]

@@ -59,14 +59,19 @@ impl AddonPreset for StremioPreset {
                 MediaKind::TvChannel,
                 MediaKind::TvProgram,
             ],
-            options: vec![AddonOption {
-                id: "manifest_url".to_string(),
-                name: "Manifest URL".to_string(),
-                description: Some("Full URL to the addon's manifest.json".to_string()),
-                required: true,
-                default: None,
-                kind: AddonOptionType::Url,
-            }],
+            options: vec![
+                AddonOption {
+                    id: "manifest_url".to_string(),
+                    name: "Manifest URL".to_string(),
+                    description: Some(
+                        "Full URL to the addon's manifest.json".to_string(),
+                    ),
+                    required: true,
+                    default: None,
+                    kind: AddonOptionType::Url,
+                },
+                language_option(),
+            ],
         }
     }
 
@@ -93,6 +98,7 @@ impl AddonPreset for StremioPreset {
             )),
             failed: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             manifest: Default::default(),
+            language: language_from_cfg(cfg),
         });
         Ok(AddonCapabilities {
             kind: Some(addon.clone()),
@@ -109,6 +115,33 @@ impl AddonPreset for StremioPreset {
 
 inventory::submit! {
     AddonPresetRegistration(|| Box::new(StremioPreset))
+}
+
+/// The optional "language" option: the language the addon's metadata is in.
+/// Empty by default, which keeps today's behavior.
+fn language_option() -> AddonOption {
+    AddonOption {
+        id: "language".to_string(),
+        name: "Metadata language".to_string(),
+        description: Some(
+            "Language this addon's metadata is in, e.g. \"en\" for Cinemeta. When it \
+             differs from the server's metadata language, an overview from a \
+             lower-priority addon in that language is used instead. Leave empty if \
+             unknown."
+                .to_string(),
+        ),
+        required: false,
+        default: None,
+        kind: AddonOptionType::String,
+    }
+}
+
+fn language_from_cfg(cfg: &serde_json::Value) -> Option<String> {
+    cfg.get("language")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
 }
 
 pub(super) fn parse_manifest_info(
@@ -218,6 +251,8 @@ pub struct StremioAddon {
     /// `medias_cache` and evicted at the same point, by `on_series_done`.
     failed: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     manifest: super::ManifestCache,
+    /// The language the addon's metadata is in, if the admin set one.
+    language: Option<String>,
 }
 
 impl StremioAddon {
@@ -479,6 +514,11 @@ impl MetaAddon for StremioAddon {
             .unwrap()
             .remove(meta_id);
     }
+
+    fn result_language(&self) -> Option<&str> {
+        self.language
+            .as_deref()
+    }
 }
 
 #[async_trait]
@@ -565,10 +605,29 @@ impl TreeAddon for StremioAddon {
                     season_idx,
                     &series_external_ids,
                 )?;
-                let now = chrono::Utc::now().naive_utc();
-                for ep in &mut episodes {
-                    // Mark refreshed so TMDB isn't called per-episode during tree sync.
-                    ep.refreshed_at = Some(now);
+                // Mark refreshed so TMDB isn't called per-episode during tree
+                // sync. Not when this addon's language differs from the
+                // metadata language: its overview is then only a fallback, and
+                // the per-episode refresh lets a lower-priority addon give it
+                // in the metadata language (see `refresh_meta`), so the stub
+                // carries none.
+                let preferred = crate::db::Settings::get_config(&ctx.db)
+                    .await
+                    .ok()
+                    .and_then(|c| c.preferred_metadata_language);
+                if crate::addons::matches_preferred_language(
+                    self.language
+                        .as_deref(),
+                    preferred.as_deref(),
+                ) {
+                    let now = chrono::Utc::now().naive_utc();
+                    for ep in &mut episodes {
+                        ep.refreshed_at = Some(now);
+                    }
+                } else {
+                    for ep in &mut episodes {
+                        ep.description = None;
+                    }
                 }
                 if episodes.is_empty() {
                     Ok(None)
