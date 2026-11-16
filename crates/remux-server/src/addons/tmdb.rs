@@ -114,12 +114,26 @@ impl MetaAddon for TmdbAddon {
         ctx: &AppContext,
         config: &crate::api::ServerConfiguration,
     ) -> Result<Option<db::Media>> {
-        match fetch_tmdb_meta(media, ctx, config).await {
+        let patch = match fetch_tmdb_meta(media, ctx, config).await {
             Err(e) if is_404(&e) => {
                 fetch_tmdb_meta_by_other_ids(media, ctx, config).await
             }
             other => other,
-        }
+        }?;
+        // TMDB is asked in the metadata language and answers in it, as
+        // Jellyfin's TMDB providers report (`ResultLanguage`); an episode
+        // TMDB has no name for in that language reports the language it
+        // came in instead (see `tmdb_episode_meta`).
+        Ok(patch.map(|mut p| {
+            if p.result_language
+                .is_none()
+            {
+                p.result_language = config
+                    .preferred_metadata_language
+                    .clone();
+            }
+            p
+        }))
     }
 
     async fn rate_limit_cooldown(&self) -> Duration {
@@ -726,16 +740,22 @@ async fn tmdb_season_episodes(
         return Ok(None);
     };
     let client = tmdb_client_from_ctx(ctx).await?;
-    let preferred_language = crate::db::Settings::get_config(&ctx.db)
+    let config = crate::db::Settings::get_config(&ctx.db)
         .await
-        .ok()
-        .and_then(|c| c.preferred_metadata_language);
+        .ok();
+    let translations_budget = config
+        .as_ref()
+        .map(|c| c.addon_fetch_timeout())
+        .unwrap_or(Duration::from_secs(5))
+        * 3
+        / 5;
+    let preferred_language = config.and_then(|c| c.preferred_metadata_language);
     let season_details = client
         .execute(
             sdks::tmdb::SeasonEndpoint {
                 series_id: series_tmdb_id,
                 season_number: season_number as i64,
-                language: preferred_language,
+                language: preferred_language.clone(),
                 append_to_response: None,
             }
             .with_cache(Duration::from_secs(360)),
@@ -743,25 +763,239 @@ async fn tmdb_season_episodes(
         .await?;
 
     let anchor = gp.series_canonical_key();
-    let episodes: Vec<db::Media> = season_details
+    // An untranslated episode costs one more request (its translations);
+    // run those side by side, or a season with many of them (90 untranslated
+    // specials) would not finish within the tree fetch timeout.
+    let preferred_language = preferred_language.as_deref();
+    let original_language = gp
+        .original_language
+        .as_deref();
+    let mut lookups = Vec::new();
+    for ep in season_details
         .episodes
+        .as_deref()
         .unwrap_or_default()
-        .into_iter()
-        .map(|ep| {
-            let mut stub = db::Media::from(&ep);
-            stub.id =
-                db::Media::episode_id(&anchor, ep.season_number, ep.episode_number);
-            stub.parent_id = Some(db::Media::season_id(&anchor, ep.season_number));
-            stub.grandparent_id = season.parent_id;
-            stub
-        })
+    {
+        lookups.push(tmdb_episode_meta(
+            &client,
+            series_tmdb_id,
+            ep,
+            preferred_language,
+            original_language,
+        ));
+    }
+    // The whole tree fetch has a timeout; translations get part of it. When
+    // they don't finish in time (TMDB slow, a huge untranslated season), the
+    // season comes back anyway: an episode that may be untranslated is left
+    // unrefreshed, so its own refresh decides its name, with its own timeout
+    // and whatever translations already arrived in the cache.
+    let lookups = futures::stream::iter(lookups)
+        .buffered(EPISODE_TRANSLATIONS_CONCURRENCY)
         .collect::<Vec<_>>();
+    let mut episodes: Vec<db::Media> =
+        match tokio::time::timeout(translations_budget, lookups).await {
+            Ok(results) => results
+                .into_iter()
+                .collect::<Result<_>>()?,
+            Err(_) => {
+                debug!(
+                    series = series_tmdb_id,
+                    season = season_number,
+                    "episode translations took too long, left to the episode refresh"
+                );
+                season_details
+                    .episodes
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|ep| {
+                        let mut stub = db::Media::from(ep);
+                        stub.result_language = preferred_language.map(str::to_string);
+                        if tmdb_episode_may_be_untranslated(ep, preferred_language) {
+                            stub.refreshed_at = None;
+                        }
+                        stub
+                    })
+                    .collect()
+            }
+        };
+    for stub in &mut episodes {
+        let (Some(season_number), Some(episode_number)) = (stub.parent_idx, stub.idx)
+        else {
+            continue;
+        };
+        stub.id = db::Media::episode_id(&anchor, season_number, episode_number);
+        stub.parent_id = Some(db::Media::season_id(&anchor, season_number));
+        stub.grandparent_id = season.parent_id;
+    }
 
     if episodes.is_empty() {
         Ok(None)
     } else {
         Ok(Some(episodes))
     }
+}
+
+/// How long an episode's TMDB translations are kept: they only decide which
+/// language an episode's name is given in, and change rarely.
+const EPISODE_TRANSLATIONS_TTL: Duration = Duration::from_secs(7 * 86400);
+
+/// How many episode translations of one season are asked for at once (TMDB
+/// allows 20 connections per IP), so that a season with 100+ untranslated
+/// specials still fits the tree fetch timeout.
+const EPISODE_TRANSLATIONS_CONCURRENCY: usize = 16;
+
+/// Whether TMDB's answer for `ep` in `language` may be its stand-in for a
+/// missing translation. TMDB then fills the name with a made-up one in the
+/// asked language ("Episode 26", "Folge 26") and leaves the overview empty,
+/// without saying so; only the episode's translations tell. Without a
+/// language TMDB answers in its default (English) as before.
+fn tmdb_episode_may_be_untranslated(
+    ep: &sdks::tmdb::Episode,
+    language: Option<&str>,
+) -> bool {
+    language.is_some_and(|l| !l.is_empty())
+        && ep
+            .overview
+            .as_deref()
+            .is_none_or(|o| {
+                o.trim()
+                    .is_empty()
+            })
+}
+
+/// The episode as a metadata result, in `language` where TMDB has it.
+///
+/// For an episode whose localized answer has no overview, the episode's
+/// translations decide: when none in `language` has a name, the name and
+/// overview come from the English translation, or else from the one in the
+/// series' original language, and the result reports that language
+/// (`result_language`), so its name is never taken for one in `language`.
+/// When no translation has a name either, TMDB's answer stays as it is.
+async fn tmdb_episode_meta(
+    client: &sdks::RestClient<sdks::BearerAuth>,
+    series_tmdb_id: i64,
+    ep: &sdks::tmdb::Episode,
+    language: Option<&str>,
+    original_language: Option<&str>,
+) -> Result<db::Media> {
+    let mut media = db::Media::from(ep);
+    media.result_language = language
+        .filter(|l| !l.is_empty())
+        .map(str::to_string);
+    let Some(language) =
+        language.filter(|_| tmdb_episode_may_be_untranslated(ep, language))
+    else {
+        return Ok(media);
+    };
+    let translations = match client
+        .execute_arc(
+            sdks::tmdb::EpisodeTranslationsEndpoint {
+                series_id: series_tmdb_id,
+                season_number: ep.season_number,
+                episode_number: ep.episode_number,
+            }
+            .with_cache(EPISODE_TRANSLATIONS_TTL),
+        )
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            let e = anyhow::Error::from(e);
+            if is_404(&e) {
+                return Ok(media);
+            }
+            return Err(e);
+        }
+    };
+    if let Some(found) = episode_translation(&translations, language, original_language)
+    {
+        media.title = found.name;
+        media.description = found.overview;
+        media.result_language = Some(found.language);
+    }
+    Ok(media)
+}
+
+/// An untranslated episode's name and overview from its translations.
+struct EpisodeTranslation {
+    /// The language the name is in, which the result reports.
+    language: String,
+    name: String,
+    overview: Option<String>,
+}
+
+/// The name comes from the first translation with a name in `language` (its
+/// own region first), else in English (US first), else in the series'
+/// original language. The overview, field by field, from the first of those
+/// that has one, so an episode with a translated name but no translated
+/// overview keeps the English overview TMDB answered with before it was
+/// asked in the metadata language.
+fn episode_translation(
+    translations: &sdks::tmdb::EpisodeTranslations,
+    language: &str,
+    original_language: Option<&str>,
+) -> Option<EpisodeTranslation> {
+    let mut parts = language.split('-');
+    let subtag = parts
+        .next()
+        .unwrap_or_default();
+    let region = parts.next();
+    let original = original_language.filter(|o| !o.is_empty());
+    let pick =
+        |lang: &str,
+         region: Option<&str>,
+         field: fn(&sdks::tmdb::EpisodeTranslationData) -> Option<&str>| {
+            let mut with_field = translations
+                .translations
+                .iter()
+                .filter(|t| {
+                    t.iso_639_1
+                        .eq_ignore_ascii_case(lang)
+                })
+                .filter_map(|t| {
+                    field(&t.data)
+                        .filter(|v| {
+                            !v.trim()
+                                .is_empty()
+                        })
+                        .map(|v| (t, v))
+                });
+            let first = with_field
+                .clone()
+                .next();
+            region
+                .and_then(|r| {
+                    with_field.find(|(t, _)| {
+                        t.iso_3166_1
+                            .eq_ignore_ascii_case(r)
+                    })
+                })
+                .or(first)
+                .map(|(_, v)| v.to_string())
+        };
+    let in_order = |field: fn(&sdks::tmdb::EpisodeTranslationData) -> Option<&str>| {
+        pick(subtag, region, field)
+            .map(|v| (language.to_string(), v))
+            .or_else(|| pick("en", Some("US"), field).map(|v| ("en".to_string(), v)))
+            .or_else(|| {
+                original.and_then(|o| pick(o, None, field).map(|v| (o.to_string(), v)))
+            })
+    };
+    let (language, name) = in_order(|d| {
+        d.name
+            .as_deref()
+    })?;
+    let overview = in_order(|d| {
+        d.overview
+            .as_deref()
+    })
+    .map(|(_, v)| v);
+    Some(EpisodeTranslation {
+        language,
+        name,
+        overview,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,6 +1417,35 @@ fn tmdb_trailers(
             })
             .collect(),
     )
+}
+
+/// The original language of an episode's series, from the preloaded parents
+/// or the stored series.
+async fn stored_series_original_language(
+    media: &db::Media,
+    ctx: &AppContext,
+) -> Option<String> {
+    if let Some(series) = media
+        .grandparent
+        .as_deref()
+        .or(media
+            .parent
+            .as_deref())
+        .filter(|g| g.kind == db::MediaKind::Series)
+    {
+        return series
+            .original_language
+            .clone();
+    }
+    let series_id = media
+        .grandparent_id
+        .or(media.parent_id)?;
+    db::Media::get_by_id(&ctx.db, &series_id)
+        .await
+        .ok()
+        .flatten()
+        .filter(|m| m.kind == db::MediaKind::Series)
+        .and_then(|m| m.original_language)
 }
 
 async fn fetch_tmdb_meta(
@@ -1677,7 +1940,24 @@ async fn fetch_tmdb_meta(
                 else {
                     return Ok(None);
                 };
-                return Ok(Some(db::Media::from(ep)));
+                let language = config
+                    .preferred_metadata_language
+                    .as_deref();
+                let original_language =
+                    if tmdb_episode_may_be_untranslated(ep, language) {
+                        stored_series_original_language(media, ctx).await
+                    } else {
+                        None
+                    };
+                return tmdb_episode_meta(
+                    &client,
+                    tmdb_id,
+                    ep,
+                    language,
+                    original_language.as_deref(),
+                )
+                .await
+                .map(Some);
             }
         }
         db::MediaKind::Season => {
@@ -2719,6 +2999,230 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn season_endpoint_sends_its_language() {
+        let ep = sdks::tmdb::SeasonEndpoint {
+            series_id: 1,
+            season_number: 2,
+            language: Some("de".into()),
+            append_to_response: None,
+        };
+        assert_eq!(ep.path(), "tv/1/season/2");
+        assert_eq!(ep.query(), vec![("language".to_string(), "de".to_string())]);
+        let ep = sdks::tmdb::SeasonEndpoint {
+            language: None,
+            ..ep
+        };
+        assert!(
+            ep.query()
+                .is_empty()
+        );
+    }
+
+    fn tmdb_episode(number: i64, name: &str, overview: &str) -> sdks::tmdb::Episode {
+        sdks::tmdb::Episode {
+            id: 1000 + number,
+            name: name.into(),
+            overview: Some(overview.into()),
+            season_number: 1,
+            episode_number: number,
+            ..Default::default()
+        }
+    }
+
+    fn translations(entries: &[(&str, &str, &str, &str)]) -> serde_json::Value {
+        serde_json::json!({
+            "id": 1,
+            "translations": entries
+                .iter()
+                .map(|(lang, region, name, overview)| serde_json::json!({
+                    "iso_639_1": lang, "iso_3166_1": region,
+                    "data": { "name": name, "overview": overview }
+                }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    /// TMDB answers a localized request for an episode nobody translated with
+    /// a made-up name ("Folge 2") and an empty overview. Only for such an
+    /// episode (empty overview) its translations decide: without a name in
+    /// the metadata language, the episode keeps its English name (or else
+    /// the one in the original language) and reports that language, so it
+    /// is never taken for a German title. With a name in the metadata
+    /// language the name stays and an empty overview is filled from the
+    /// English (else original-language) translation; with no name anywhere,
+    /// TMDB's answer stays.
+    #[tokio::test]
+    async fn untranslated_tmdb_episodes_keep_their_english_name() {
+        let tmdb = httpmock::MockServer::start();
+        let base = "/tv/900101/season/1/episode";
+        let mut mocks = Vec::new();
+        for (episode, body) in [
+            (
+                2,
+                translations(&[
+                    ("de", "DE", "", ""),
+                    ("en", "GB", "Promise (GB)", ""),
+                    ("en", "US", "Each One's Promise", "Subaru wakes up."),
+                    ("ja", "JP", "それぞれの誓い", ""),
+                ]),
+            ),
+            (
+                3,
+                translations(&[
+                    ("de", "AT", "Dritte (AT)", ""),
+                    ("de", "DE", "Dritte", ""),
+                    ("en", "US", "Third", "Third overview."),
+                ]),
+            ),
+            (
+                4,
+                translations(&[
+                    ("de", "DE", "", ""),
+                    ("en", "US", "", ""),
+                    ("ja", "JP", "第四話", "あらすじ"),
+                ]),
+            ),
+            (
+                5,
+                translations(&[("de", "DE", "", ""), ("en", "US", "", "")]),
+            ),
+        ] {
+            mocks.push(tmdb.mock(|when, then| {
+                when.path(format!("{base}/{episode}/translations"));
+                then.status(200)
+                    .json_body(body);
+            }));
+        }
+        let untouched = tmdb.mock(|when, then| {
+            when.path(format!("{base}/1/translations"));
+            then.status(200)
+                .json_body(translations(&[]));
+        });
+        let client = tmdb_client("test", &tmdb.base_url()).unwrap();
+        let mut got = Vec::new();
+        for ep in [
+            tmdb_episode(1, "Das Ende vom Anfang", "Subaru kommt an."),
+            tmdb_episode(2, "Folge 2", ""),
+            tmdb_episode(3, "Folge 3", ""),
+            tmdb_episode(4, "Folge 4", ""),
+            tmdb_episode(5, "Folge 5", ""),
+        ] {
+            let m = tmdb_episode_meta(&client, 900101, &ep, Some("de-DE"), Some("ja"))
+                .await
+                .unwrap();
+            got.push((m.title, m.description, m.result_language));
+        }
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "Das Ende vom Anfang".into(),
+                    s("Subaru kommt an."),
+                    s("de-DE")
+                ),
+                ("Each One's Promise".into(), s("Subaru wakes up."), s("en")),
+                ("Dritte".into(), s("Third overview."), s("de-DE")),
+                ("第四話".into(), s("あらすじ"), s("ja")),
+                ("Folge 5".into(), None, s("de-DE")),
+            ]
+        );
+        untouched.assert_hits(0);
+        for m in &mocks {
+            m.assert_hits(1);
+        }
+    }
+
+    /// Without a metadata language TMDB answers in its default language as
+    /// before, and no translations are asked for.
+    #[tokio::test]
+    async fn tmdb_episodes_without_a_metadata_language_are_unchanged() {
+        let tmdb = httpmock::MockServer::start();
+        let translations_mock = tmdb.mock(|when, then| {
+            when.path_contains("/translations");
+            then.status(200)
+                .json_body(translations(&[]));
+        });
+        let client = tmdb_client("test", &tmdb.base_url()).unwrap();
+        let ep = tmdb_episode(2, "Episode 2", "");
+        let m = tmdb_episode_meta(&client, 900102, &ep, None, Some("ja"))
+            .await
+            .unwrap();
+        let mut expected = db::Media::from(&ep);
+        expected.refreshed_at = m.refreshed_at;
+        assert_eq!(
+            (m.title, m.description, m.result_language),
+            (expected.title, expected.description, None)
+        );
+        translations_mock.assert_hits(0);
+    }
+
+    /// The per-episode refresh goes the same way, and reports the language
+    /// of its result: the metadata language, or the one the name came in.
+    #[tokio::test]
+    async fn tmdb_episode_refresh_reports_the_language_of_its_name() {
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/tv/900103/season/0")
+                .query_param("language", "de");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": 9001030, "season_number": 0, "name": "Specials",
+                    "episodes": [
+                        { "id": 1, "name": "Folge 1", "overview": "", "season_number": 0, "episode_number": 1 },
+                        { "id": 2, "name": "Hinter den Kulissen", "overview": "Ein Blick.",
+                          "season_number": 0, "episode_number": 2 }
+                    ]
+                }));
+        });
+        tmdb.mock(|when, then| {
+            when.path("/tv/900103/season/0/episode/1/translations");
+            then.status(200)
+                .json_body(translations(&[
+                    ("de", "DE", "", ""),
+                    ("en", "US", "Inside the Show", "A look."),
+                ]));
+        });
+        let guard = ctx_with_tmdb(&tmdb).await;
+        let series = Arc::new(db::Media {
+            kind: db::MediaKind::Series,
+            original_language: Some("en".into()),
+            external_ids: db::ExternalIds {
+                tmdb: Some(900103),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let config = crate::api::ServerConfiguration {
+            preferred_metadata_language: Some("de".into()),
+            ..Default::default()
+        };
+        let mut got = Vec::new();
+        for idx in [1, 2] {
+            let episode = db::Media {
+                kind: db::MediaKind::Episode,
+                parent_idx: Some(0),
+                idx: Some(idx),
+                grandparent: Some(series.clone()),
+                ..Default::default()
+            };
+            let patch = TmdbAddon
+                .meta_fetch(&episode, &guard.0, &config)
+                .await
+                .unwrap()
+                .expect("patch");
+            got.push((patch.title, patch.result_language));
+        }
+        assert_eq!(
+            got,
+            vec![
+                ("Inside the Show".to_string(), Some("en".to_string())),
+                ("Hinter den Kulissen".to_string(), Some("de".to_string())),
+            ]
         );
     }
 }

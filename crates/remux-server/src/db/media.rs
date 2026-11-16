@@ -1717,6 +1717,12 @@ pub struct Media {
     pub user_state: Option<super::UserMediaState>,
     #[sqlx(skip)]
     pub relations: Option<Vec<(MediaRelation, Media)>>,
+    /// Language a metadata addon's result is in, when the addon knows it
+    /// (Jellyfin's `MetadataResult.ResultLanguage`). Only meaningful on a
+    /// fresh addon result, never stored.
+    #[sqlx(skip)]
+    #[serde(skip)]
+    pub result_language: Option<String>,
     /// Preloaded direct parent (season, album, channel, etc.). `Arc`, not
     /// `Box`: this gets cloned once per child when fanning out a season's/
     /// series' children (see `process_meta_item_inner`), and a `Box` clone

@@ -146,15 +146,19 @@ pub struct Season {
     pub external_ids: Option<super::ExternalIds>,
 }
 
+#[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeasonEndpoint {
+    #[serde(skip)]
     pub series_id: i64,
+    #[serde(skip)]
     pub season_number: i64,
 
     // #[builder(default = "en")]
     pub language: Option<String>,
 
     //#[builder(default = "Some(vec![\"images\".to_string(), \"external_ids\".to_string()])")]
+    #[serde(serialize_with = "serialize_comma_opt")]
     pub append_to_response: Option<Vec<String>>,
 }
 
@@ -166,6 +170,53 @@ impl Endpoint for SeasonEndpoint {
     fn path(&self) -> String {
         format!("tv/{}/season/{}", self.series_id, self.season_number)
     }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        self
+    }
+}
+
+/// `GET /tv/{id}/season/{s}/episode/{e}/translations`: the episode's name and
+/// overview in every language TMDB has an entry for (fields of a language
+/// nobody translated are empty).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpisodeTranslationsEndpoint {
+    pub series_id: i64,
+    pub season_number: i64,
+    pub episode_number: i64,
+}
+
+impl Endpoint for EpisodeTranslationsEndpoint {
+    type Output = EpisodeTranslations;
+
+    fn path(&self) -> String {
+        format!(
+            "tv/{}/season/{}/episode/{}/translations",
+            self.series_id, self.season_number, self.episode_number
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EpisodeTranslations {
+    #[serde(default)]
+    pub translations: Vec<EpisodeTranslation>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EpisodeTranslation {
+    #[serde(default)]
+    pub iso_639_1: String,
+    #[serde(default)]
+    pub iso_3166_1: String,
+    #[serde(default)]
+    pub data: EpisodeTranslationData,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EpisodeTranslationData {
+    pub name: Option<String>,
+    pub overview: Option<String>,
 }
 
 #[serde_as]
