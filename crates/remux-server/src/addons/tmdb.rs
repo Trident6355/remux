@@ -3368,6 +3368,27 @@ mod tests {
         cinemeta_language: Option<&str>,
         preferred_language: Option<&str>,
     ) -> Vec<EpisodeRow> {
+        rezero_with_cinemeta_runs(
+            cinemeta_language,
+            preferred_language,
+            false,
+            1,
+            false,
+        )
+        .await
+    }
+
+    /// `rezero_with_cinemeta`, refreshed `refreshes` times, with the series
+    /// title locked or not; with `existing_s1e1` the library already holds
+    /// S1E1 from TMDB (German title, refreshed) before Cinemeta's episode
+    /// list arrives.
+    async fn rezero_with_cinemeta_runs(
+        cinemeta_language: Option<&str>,
+        preferred_language: Option<&str>,
+        lock_series_title: bool,
+        refreshes: usize,
+        existing_s1e1: bool,
+    ) -> Vec<EpisodeRow> {
         let cinemeta = httpmock::MockServer::start();
         // Own path: the HTTP response cache is process-wide and keyed by URL,
         // and a parallel test run reuses mock servers' ports.
@@ -3497,6 +3518,11 @@ mod tests {
             id: Uuid::new_v4(),
             kind: db::MediaKind::Series,
             title: "Re:ZERO".into(),
+            locked_fields: if lock_series_title {
+                vec![db::MetadataField::Name]
+            } else {
+                vec![]
+            },
             external_ids: db::ExternalIds {
                 tmdb: Some(65942),
                 imdb: db::NonEmptyString::try_new("tt5607616").ok(),
@@ -3508,12 +3534,55 @@ mod tests {
             .save(&ctx.db)
             .await
             .unwrap();
-        let ids = ctx
-            .addons
-            .process_meta_batch(vec![series.clone()], ctx, false, None)
-            .await
-            .unwrap();
-        let series_id = ids[&series.id];
+        if existing_s1e1 {
+            let key = series.series_canonical_key();
+            let season1 = db::Media::season_id(&key, 1);
+            for mut m in [
+                db::Media {
+                    id: season1,
+                    kind: db::MediaKind::Season,
+                    title: "Season 1".into(),
+                    parent_id: Some(series.id),
+                    grandparent_id: Some(series.id),
+                    idx: Some(1),
+                    refreshed_at: Some(now),
+                    created_at: now,
+                    updated_at: now,
+                    ..Default::default()
+                },
+                db::Media {
+                    id: db::Media::episode_id(&key, 1, 1),
+                    kind: db::MediaKind::Episode,
+                    title: "Das Ende vom Anfang".into(),
+                    description: Some("Subaru kommt an.".into()),
+                    parent_id: Some(season1),
+                    grandparent_id: Some(series.id),
+                    parent_idx: Some(1),
+                    idx: Some(1),
+                    external_ids: db::ExternalIds {
+                        tmdb: Some(1176875),
+                        ..Default::default()
+                    },
+                    refreshed_at: Some(now),
+                    created_at: now,
+                    updated_at: now,
+                    ..Default::default()
+                },
+            ] {
+                m.save(&ctx.db)
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut series_id = series.id;
+        for _ in 0..refreshes {
+            let ids = ctx
+                .addons
+                .process_meta_batch(vec![series.clone()], ctx, false, None)
+                .await
+                .unwrap();
+            series_id = ids[&series.id];
+        }
 
         let mut rows: Vec<EpisodeRow> = sqlx::query_as(
             "SELECT parent_idx, idx, title, description, CAST(json_extract(external_ids, '$.tmdb') AS INTEGER) \
@@ -3542,10 +3611,12 @@ mod tests {
     }
 
     /// With German as metadata language and the Cinemeta addon marked as
-    /// English, overviews are only a fallback (Jellyfin's rule) and TMDB's
-    /// German overview replaces them; TMDB finds its own episode by TVDB id
-    /// where it numbers it differently. Titles and numbering stay Cinemeta's.
-    /// Where TMDB has no German text (the special), Cinemeta's stays.
+    /// English, titles and overviews are only a fallback (Jellyfin's rule,
+    /// extended to titles) and TMDB's German ones replace them; TMDB finds
+    /// its own episode by TVDB id where it numbers it differently. The
+    /// numbering stays Cinemeta's. Where TMDB has no German name (the
+    /// special: TMDB answers "Folge 1", its translations have no German
+    /// name), Cinemeta's English title and overview stay.
     #[tokio::test]
     async fn english_addon_overviews_give_way_to_tmdb_in_the_metadata_language() {
         assert_eq!(
@@ -3561,19 +3632,77 @@ mod tests {
                 row(
                     Some(1),
                     Some(1),
-                    "The End of the Beginning",
+                    "Das Ende vom Anfang",
                     "Subaru kommt an.",
                     Some(1176875)
                 ),
                 row(
                     Some(2),
                     Some(1),
-                    "Each One's Promise",
+                    "Verschiedene Versprechen",
                     "Subaru wacht auf.",
                     Some(4319552)
                 ),
-                row(None, None, "Re:ZERO", "Deutsche Beschreibung.", None),
+                row(None, None, "Re:ZERO DE", "Deutsche Beschreibung.", None),
             ]
+        );
+    }
+
+    /// Further (normal) refreshes rebuild the episodes from Cinemeta's
+    /// English list; the titles chosen by language must survive them.
+    #[tokio::test]
+    async fn titles_in_the_metadata_language_survive_another_refresh() {
+        assert_eq!(
+            rezero_with_cinemeta_runs(Some("en"), Some("de"), false, 3, false).await,
+            rezero_with_cinemeta(Some("en"), Some("de")).await
+        );
+    }
+
+    /// A library that already has the episode from TMDB (German title,
+    /// refreshed) switches to Cinemeta, and the episode keeps its number:
+    /// Cinemeta's English stub must not replace the German title.
+    #[tokio::test]
+    async fn switching_to_cinemeta_keeps_the_title_of_an_unchanged_episode() {
+        let rows =
+            rezero_with_cinemeta_runs(Some("en"), Some("de"), false, 1, true).await;
+        assert_eq!(
+            rows[1],
+            row(
+                Some(1),
+                Some(1),
+                "Das Ende vom Anfang",
+                "Subaru kommt an.",
+                Some(1176875)
+            )
+        );
+        assert_eq!(rows[2].2, "Verschiedene Versprechen");
+    }
+
+    /// A locked title stays; the overview still follows the language.
+    #[tokio::test]
+    async fn locked_title_stays_when_the_language_differs() {
+        let rows =
+            rezero_with_cinemeta_runs(Some("en"), Some("de"), true, 1, false).await;
+        assert_eq!(
+            rows.last(),
+            Some(&row(None, None, "Re:ZERO", "Deutsche Beschreibung.", None))
+        );
+    }
+
+    /// The title replaced by language is the item's title everywhere: the
+    /// sort name clients get is derived from it, and search matches it.
+    #[test]
+    fn sort_name_follows_the_title() {
+        let media = db::Media {
+            kind: db::MediaKind::Episode,
+            title: "Verschiedene Versprechen".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::api::models::db_media_to_item(media, true)
+                .sort_name
+                .as_deref(),
+            Some("verschiedene versprechen")
         );
     }
 

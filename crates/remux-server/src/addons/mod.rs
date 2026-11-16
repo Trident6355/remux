@@ -2124,6 +2124,13 @@ impl AddonService {
             .preferred_metadata_language
             .as_deref();
         let mut overview_is_fallback = false;
+        // The same rule for the title (Jellyfin applies it to the overview
+        // and tagline only). `replaced_title` keeps the fallback title that a
+        // result in the preferred language displaced: the item may already
+        // carry it (a tree stub or an earlier refresh), and only that exact
+        // text is replaced below.
+        let mut title_is_fallback = false;
+        let mut replaced_title: Option<String> = None;
         for (r, result) in applicable
             .iter()
             .zip(results)
@@ -2148,6 +2155,14 @@ impl AddonService {
                             acc.description = None;
                             overview_is_fallback = false;
                         }
+                        if title_is_fallback
+                            && !patch
+                                .title
+                                .is_empty()
+                        {
+                            replaced_title = Some(std::mem::take(&mut acc.title));
+                            title_is_fallback = false;
+                        }
                     } else {
                         overview_is_fallback |= acc
                             .description
@@ -2155,6 +2170,12 @@ impl AddonService {
                             && patch
                                 .description
                                 .is_some();
+                        title_is_fallback |= acc
+                            .title
+                            .is_empty()
+                            && !patch
+                                .title
+                                .is_empty();
                     }
                     apply_meta(acc, patch, false);
                 }
@@ -2170,7 +2191,23 @@ impl AddonService {
             }
         }
         if let Some(combined) = combined {
+            // A title in the preferred language replaces the fallback title
+            // the item already carries; a title set any other way (by hand,
+            // by an addon without a language) stays, as does a locked one.
+            let preferred_title = replaced_title
+                .filter(|old| *old == media.title)
+                .map(|_| {
+                    combined
+                        .title
+                        .clone()
+                })
+                .filter(|t| !t.is_empty());
             apply_meta(media, combined, force_refresh);
+            if let Some(title) = preferred_title {
+                if !media.is_field_locked(&db::MetadataField::Name) {
+                    media.title = title;
+                }
+            }
         }
 
         // Apply SxxExx / "Season N" title formatting once, after all patches are merged.
@@ -2890,6 +2927,26 @@ impl AddonService {
                         gc.grandparent_id = Some(actual_root_id);
                         gc.grandparent = Some(gp_stub.clone());
 
+                        // A stub its tree addon left unrefreshed because its
+                        // text is in another language than the metadata
+                        // language is refreshed every time: written as is, its
+                        // fallback title would replace the title an earlier
+                        // refresh chose (the stored refresh time adopted below
+                        // would otherwise skip that refresh).
+                        let stub_is_fallback = gc
+                            .refreshed_at
+                            .is_none()
+                            && gc
+                                .result_language
+                                .is_some()
+                            && !matches_preferred_language(
+                                gc.result_language
+                                    .as_deref(),
+                                config
+                                    .preferred_metadata_language
+                                    .as_deref(),
+                            );
+
                         // Adopt existing UUID + refreshed_at from the pre-loaded grandchild
                         // map. `gc` is freshly parsed from the addon's raw response, which
                         // has no concept of refreshed_at — without adopting it here too,
@@ -2918,9 +2975,12 @@ impl AddonService {
                         let in_active_window = is_continuing
                             && matches!(gc.kind, db::MediaKind::Episode)
                             && episode_in_active_window_with(&gc, stored_digital);
-                        if let Some(effective_force) =
+                        let refresh = if stub_is_fallback {
+                            Some(force_refresh || in_active_window)
+                        } else {
                             child_refresh_force(force_refresh, in_active_window, &gc)
-                        {
+                        };
+                        if let Some(effective_force) = refresh {
                             let _permit = semaphore
                                 .acquire()
                                 .instrument(tracing::debug_span!(target: "remux_server::metadata_refresh", "permit_wait"))

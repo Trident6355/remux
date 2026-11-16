@@ -125,8 +125,8 @@ fn language_option() -> AddonOption {
         name: "Metadata language".to_string(),
         description: Some(
             "Language this addon's metadata is in, e.g. \"en\" for Cinemeta. When it \
-             differs from the server's metadata language, an overview from a \
-             lower-priority addon in that language is used instead. Leave empty if \
+             differs from the server's metadata language, titles and overviews from a \
+             lower-priority addon in that language are used instead. Leave empty if \
              unknown."
                 .to_string(),
         ),
@@ -627,6 +627,11 @@ impl TreeAddon for StremioAddon {
                 } else {
                     for ep in &mut episodes {
                         ep.description = None;
+                        // Tells the tree walk this stub's text is only a
+                        // fallback, so it is refreshed before it is written.
+                        ep.result_language = self
+                            .language
+                            .clone();
                     }
                 }
                 if episodes.is_empty() {
