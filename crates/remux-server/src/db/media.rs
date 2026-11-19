@@ -1045,6 +1045,16 @@ impl MediaRelation {
     }
 }
 
+/// The seasons and episodes one settled tree walk of a series wrote (see
+/// `Media::remove_obsolete_series_children`).
+#[derive(Debug, Default)]
+pub struct SeriesTreeWalk {
+    pub seasons: HashSet<Uuid>,
+    pub episodes: HashSet<Uuid>,
+    /// The TMDB episode id each episode row held before the walk.
+    pub held_before: HashMap<Uuid, i64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Rating {
     pub score: f64,
@@ -1174,6 +1184,10 @@ pub struct ExternalIds {
     /// addon's `/meta/{type}/{id}.json` and `/stream/{type}/{id}.json` routes
     /// require this exact string — losing it causes later lookups to 404.
     pub custom_stremio_type: Option<String>,
+    /// A TMDB episode's own season and episode number, "season:episode".
+    /// The row's numbers can be another numbering's (see
+    /// `seasons_by_stream_numbering`), and TMDB is only ever asked by its own.
+    pub tmdb_episode_number: Option<String>,
     /// Flat album name for tracks that have no parent row (e.g. playlist imports).
     pub album_title: Option<String>,
     /// Flat artist name for tracks that have no grandparent row (e.g. playlist imports).
@@ -1453,6 +1467,11 @@ impl ExternalIds {
         merge_option(
             &mut self.custom_stremio_type,
             &source.custom_stremio_type,
+            replace,
+        );
+        merge_option(
+            &mut self.tmdb_episode_number,
+            &source.tmdb_episode_number,
             replace,
         );
     }
@@ -2408,6 +2427,28 @@ impl Media {
             }
         }
         raw
+    }
+
+    /// The season and episode number TMDB knows this episode by: the stored
+    /// `tmdb_episode_number`, else the row's own numbers.
+    pub fn tmdb_episode_numbers(&self) -> (Option<i64>, Option<i64>) {
+        self.external_ids
+            .tmdb_episode_number
+            .as_deref()
+            .and_then(|n| n.split_once(':'))
+            .and_then(|(s, e)| {
+                Some((
+                    Some(
+                        s.parse()
+                            .ok()?,
+                    ),
+                    Some(
+                        e.parse()
+                            .ok()?,
+                    ),
+                ))
+            })
+            .unwrap_or((self.parent_idx, self.idx))
     }
 
     /// All Stremio-formatted IDs this item could be requested under. Convenience wrapper
@@ -3652,6 +3693,288 @@ impl Media {
             &MediaKind::Episode,
             &format!("{series_key}:{season_idx}:{ep_idx}"),
         )
+    }
+
+    /// Remove the seasons and episodes of `series` that a refresh made
+    /// obsolete, by Jellyfin's rules (`SeriesMetadataService.
+    /// RemoveObsoleteEpisodes`/`RemoveObsoleteSeasons`), with the episodes
+    /// the tree walk just wrote standing in for Jellyfin's physical ones.
+    /// An episode the walk did not write is removed only when
+    /// - it has no episode number, or
+    /// - a written episode has its season and episode number, or
+    /// - the same episode was written under another number: one of its
+    ///   provider ids (TMDB, TVDB, IMDb) belongs to a written episode, and to
+    ///   only one in the whole series.
+    /// Being absent from the walk alone never removes anything. A season the
+    /// walk did not write is removed only once it has no episodes left.
+    /// Nothing locked is removed: not a locked episode or season, and nothing
+    /// of a locked series (Jellyfin has no such check here, but never
+    /// refreshes a locked item from its providers to begin with).
+    /// Watch state of a removed episode moves to the written episode it
+    /// duplicates. Returns (seasons removed, episodes removed, watch-state
+    /// rows moved).
+    pub async fn remove_obsolete_series_children(
+        db: &SqlitePool,
+        series: &Media,
+        walk: &SeriesTreeWalk,
+    ) -> Result<(usize, usize, u64)> {
+        if walk
+            .episodes
+            .is_empty()
+        {
+            return Ok((0, 0, 0));
+        }
+        let series_locked: Option<bool> =
+            sqlx::query_scalar("SELECT is_locked FROM media WHERE id = ?")
+                .bind(series.id)
+                .fetch_optional(db)
+                .await?;
+        if series.is_locked || series_locked == Some(true) {
+            return Ok((0, 0, 0));
+        }
+        type Row = (
+            Uuid,
+            String,
+            Option<Uuid>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            bool,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, CAST(kind AS TEXT), parent_id, idx, parent_idx, external_ids, is_locked FROM media \
+             WHERE (kind = 'season' AND parent_id = ?1) OR (kind = 'episode' AND grandparent_id = ?1)",
+        )
+        .bind(series.id)
+        .fetch_all(db)
+        .await?;
+        let provider_keys = |raw: &Option<String>| -> Vec<String> {
+            let ids: ExternalIds = raw
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            let mut keys = Vec::new();
+            if let Some(t) = ids.tmdb {
+                keys.push(format!("tmdb={t}"));
+            }
+            if let Some(t) = ids.tvdb {
+                keys.push(format!("tvdb={t}"));
+            }
+            if let Some(t) = ids
+                .imdb
+                .as_deref()
+            {
+                keys.push(format!("imdb={t}"));
+            }
+            keys
+        };
+        let written: Vec<&Row> = rows
+            .iter()
+            .filter(|r| {
+                r.1 == "episode"
+                    && walk
+                        .episodes
+                        .contains(&r.0)
+            })
+            .collect();
+        // Jellyfin's `GetPresentEpisodeIds`: only ids that name exactly one
+        // present episode across the whole series identify an episode.
+        let mut key_count: HashMap<String, (usize, &Row)> = HashMap::new();
+        for r in &written {
+            for key in provider_keys(&r.5) {
+                key_count
+                    .entry(key)
+                    .and_modify(|e| e.0 += 1)
+                    .or_insert((1, r));
+            }
+        }
+        let by_position: HashMap<(i64, i64), &Row> = written
+            .iter()
+            .filter_map(|r| Some(((r.4?, r.3?), *r)))
+            .collect();
+
+        // (obsolete episode, written episode it duplicates)
+        let mut obsolete: Vec<(&Row, Option<&Row>)> = Vec::new();
+        for r in rows
+            .iter()
+            .filter(|r| {
+                r.1 == "episode"
+                    && !r.6
+                    && !walk
+                        .episodes
+                        .contains(&r.0)
+            })
+        {
+            let Some(idx) = r.3 else {
+                obsolete.push((r, None));
+                continue;
+            };
+            if let Some(target) =
+                r.4.and_then(|s| by_position.get(&(s, idx)))
+            {
+                obsolete.push((r, Some(*target)));
+                continue;
+            }
+            if let Some(target) = provider_keys(&r.5)
+                .iter()
+                .find_map(|k| {
+                    key_count
+                        .get(k)
+                        .filter(|e| e.0 == 1)
+                })
+            {
+                obsolete.push((r, Some(target.1)));
+            }
+        }
+        let removed_episodes: HashSet<Uuid> = obsolete
+            .iter()
+            .map(|(r, _)| r.0)
+            .collect();
+        let obsolete_seasons: Vec<Uuid> = rows
+            .iter()
+            .filter(|s| {
+                s.1 == "season"
+                    && !s.6
+                    && !walk
+                        .seasons
+                        .contains(&s.0)
+            })
+            .filter(|s| {
+                !rows
+                    .iter()
+                    .any(|e| {
+                        e.1 == "episode"
+                            && e.2 == Some(s.0)
+                            && !removed_episodes.contains(&e.0)
+                    })
+            })
+            .map(|s| s.0)
+            .collect();
+        // (row the watch state leaves, written row it belongs to now)
+        let mut moves: Vec<(Uuid, &Row)> = obsolete
+            .iter()
+            .filter_map(|(old, target)| Some((old.0, (*target)?)))
+            .collect();
+        // A written row that held another episode before the walk (the
+        // numbering changed under it): its watch state is that episode's,
+        // and follows it to the row it was written to.
+        let tmdb_id = |r: &Row| -> Option<i64> {
+            r.5.as_deref()
+                .and_then(|s| serde_json::from_str::<ExternalIds>(s).ok())
+                .and_then(|ids| ids.tmdb)
+        };
+        for r in &written {
+            let Some(&held) = walk
+                .held_before
+                .get(&r.0)
+            else {
+                continue;
+            };
+            if tmdb_id(r) == Some(held) {
+                continue;
+            }
+            if let Some(target) = key_count
+                .get(&format!("tmdb={held}"))
+                .filter(|e| e.0 == 1)
+            {
+                moves.push((r.0, target.1));
+            }
+        }
+        if obsolete.is_empty() && obsolete_seasons.is_empty() && moves.is_empty() {
+            return Ok((0, 0, 0));
+        }
+
+        let _permit = DB_WRITE_SEMAPHORE
+            .acquire()
+            .await
+            .unwrap();
+        // Immediate: the transaction reads before it writes, and a plain one
+        // fails with a busy snapshot when another writer commits in between.
+        let mut tx = db
+            .begin_with("BEGIN IMMEDIATE")
+            .await?;
+        // All moves at once, through a scratch table: rows can trade places
+        // (A's state goes to B while B's goes to C), which row-by-row
+        // updates would chain or trip over the primary key.
+        let mut moved = 0;
+        if !moves.is_empty() {
+            let columns: Vec<String> = sqlx::query_scalar(
+                "SELECT name FROM pragma_table_info('user_media_state')",
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            let columns = columns.join(", ");
+            sqlx::query("DROP TABLE IF EXISTS temp.ums_moving")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "CREATE TEMP TABLE ums_moving AS \
+                 SELECT *, 0 AS moving_done FROM user_media_state WHERE 0",
+            )
+            .execute(&mut *tx)
+            .await?;
+            for (from, _) in &moves {
+                sqlx::query(
+                    "INSERT INTO ums_moving SELECT *, 0 FROM user_media_state WHERE media_id = ?",
+                )
+                .bind(from)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DELETE FROM user_media_state WHERE media_id = ?")
+                    .bind(from)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            for (from, target) in &moves {
+                let identity = Media {
+                    kind: MediaKind::Episode,
+                    idx: target.3,
+                    parent_idx: target.4,
+                    ..Default::default()
+                }
+                .identity_raw(Some(&series.external_ids))
+                .identity_key();
+                sqlx::query(
+                    "UPDATE ums_moving SET media_id = ?, media_raw = ?, moving_done = 1 \
+                     WHERE media_id = ? AND moving_done = 0",
+                )
+                .bind(target.0)
+                .bind(identity)
+                .bind(from)
+                .execute(&mut *tx)
+                .await?;
+            }
+            // A user who already has state on the episode keeps it.
+            moved = sqlx::query(&format!(
+                "INSERT OR IGNORE INTO user_media_state ({columns}) \
+                 SELECT {columns} FROM ums_moving WHERE moving_done = 1"
+            ))
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            sqlx::query("DROP TABLE temp.ums_moving")
+                .execute(&mut *tx)
+                .await?;
+        }
+        for id in obsolete
+            .iter()
+            .map(|(r, _)| &r.0)
+            .chain(&obsolete_seasons)
+        {
+            // Relations where the item is the left side (its cast, crew,
+            // genres) have no foreign key; the rest cascade with the row.
+            sqlx::query("DELETE FROM media_relations WHERE left_media_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM media WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit()
+            .await?;
+        Ok((obsolete_seasons.len(), obsolete.len(), moved))
     }
 
     /// Update all `parent_id` / `grandparent_id` references from `old_id` to `new_id`
