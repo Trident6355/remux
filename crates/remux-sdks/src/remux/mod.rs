@@ -745,6 +745,12 @@ pub struct ServerConfiguration {
     pub filter_by_digital_release_date: bool,
     #[default(0_i64)]
     pub digital_release_buffer_days: i64,
+    /// Arrange a TMDB series' seasons and episodes by the numbering stream
+    /// add-ons use (TVDB's aired order, as Cinemeta lists it) instead of
+    /// TMDB's own. Names, overviews and images stay TMDB's. Applies only to
+    /// a series whose regular episodes can all be placed; off by default.
+    #[default(false)]
+    pub seasons_by_stream_numbering: bool,
     pub tmdb_api_key: Option<String>,
     pub subtitle_languages: Option<Vec<String>>,
     #[default(Some(false))]

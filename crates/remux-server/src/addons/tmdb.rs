@@ -588,6 +588,12 @@ impl From<&sdks::tmdb::Episode> for db::Media {
             refreshed_at: Some(chrono::Utc::now().naive_utc()),
             ..Default::default()
         };
+        // Set even when the row carries the same numbers, so a stored one
+        // can't go stale.
+        media
+            .external_ids
+            .tmdb_episode_number =
+            Some(format!("{}:{}", ep.season_number, ep.episode_number));
         if let Some(url) = tmdb_image(
             ep.still_path
                 .as_deref(),
@@ -701,18 +707,62 @@ async fn tmdb_series_seasons(
     cinemeta_episodes(series, ctx).await;
 
     let series_key = series.series_canonical_key();
+    let layout = stream_layout(series, series.id, ctx).await?;
 
-    let seasons: Vec<db::Media> = tv
+    let mut seasons: Vec<db::Media> = tv
         .seasons
         .iter()
-        .map(|s| {
-            let mut stub = db::Media::from(s);
-            stub.id = db::Media::season_id(&series_key, s.season_number);
-            stub.parent_id = Some(series.id);
-            stub.grandparent_id = Some(series.id);
-            stub
+        // In the stream numbering a TMDB season stays when it holds
+        // episodes there, or holds none anywhere (an announced one).
+        .filter(|s| {
+            layout
+                .as_ref()
+                .is_none_or(|l| {
+                    l.seasons
+                        .contains(&s.season_number)
+                        || !l
+                            .tmdb_seasons
+                            .contains(&s.season_number)
+                })
         })
+        .map(|s| db::Media::from(s))
         .collect::<Vec<_>>();
+    // Seasons only the stream numbering has: no TMDB season to describe
+    // them, released when their first episode was.
+    if let Some(layout) = &layout {
+        for &number in &layout.seasons {
+            if seasons
+                .iter()
+                .any(|s| s.idx == Some(number))
+            {
+                continue;
+            }
+            let released_at = layout
+                .episodes
+                .iter()
+                .filter(|e| e.parent_idx == Some(number))
+                .filter_map(|e| e.released_at)
+                .min();
+            seasons.push(db::Media {
+                kind: db::MediaKind::Season,
+                title: crate::addons::season_title(number),
+                idx: Some(number),
+                released_at,
+                digital_released_at: released_at,
+                ..Default::default()
+            });
+        }
+        seasons.sort_by_key(|s| s.idx);
+    }
+    for stub in &mut seasons {
+        stub.id = db::Media::season_id(
+            &series_key,
+            stub.idx
+                .unwrap_or_default(),
+        );
+        stub.parent_id = Some(series.id);
+        stub.grandparent_id = Some(series.id);
+    }
 
     if seasons.is_empty() {
         Ok(None)
@@ -733,11 +783,51 @@ async fn tmdb_season_episodes(
     ) else {
         return Ok(None);
     };
+    if gp
+        .external_ids
+        .tmdb
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let Some(series_id) = season.parent_id else {
+        return Ok(None);
+    };
+    let episodes = match stream_layout(gp, series_id, ctx).await? {
+        Some(layout) => layout
+            .episodes
+            .iter()
+            .filter(|e| e.parent_idx == Some(season_number))
+            .cloned()
+            .collect(),
+        None => {
+            tmdb_season_stubs(gp, series_id, season_number, ctx)
+                .await?
+                .0
+        }
+    };
+    if episodes.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(episodes))
+    }
+}
+
+/// The episodes of one TMDB season of `series`, in TMDB's numbering, with
+/// their ids, names and stream ids. Also whether every episode's external
+/// ids were answered: a failed call leaves episodes without, which is fine
+/// for matching streams but must not be read as "has none".
+async fn tmdb_season_stubs(
+    gp: &db::Media,
+    series_id: Uuid,
+    season_number: i64,
+    ctx: &AppContext,
+) -> Result<(Vec<db::Media>, bool)> {
     let Some(series_tmdb_id) = gp
         .external_ids
         .tmdb
     else {
-        return Ok(None);
+        return Ok((Vec::new(), true));
     };
     let client = tmdb_client_from_ctx(ctx).await?;
     let preferred_language = crate::db::Settings::get_config(&ctx.db)
@@ -766,12 +856,13 @@ async fn tmdb_season_episodes(
             stub.id =
                 db::Media::episode_id(&anchor, ep.season_number, ep.episode_number);
             stub.parent_id = Some(db::Media::season_id(&anchor, ep.season_number));
-            stub.grandparent_id = season.parent_id;
+            stub.grandparent_id = Some(series_id);
             stub
         })
         .collect::<Vec<_>>();
-    add_episode_external_ids(&client, series_tmdb_id, season_number, &mut episodes)
-        .await;
+    let ids_complete =
+        add_episode_external_ids(&client, series_tmdb_id, season_number, &mut episodes)
+            .await;
     if let (Some(cinemeta), Some(imdb)) = (
         cinemeta_episodes(gp, ctx).await,
         gp.external_ids
@@ -780,12 +871,240 @@ async fn tmdb_season_episodes(
     ) {
         add_stremio_ids(&cinemeta, imdb, &mut episodes);
     }
+    Ok((episodes, ids_complete))
+}
 
-    if episodes.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(episodes))
+/// A series' episodes, arranged by the numbering stream addons use where the
+/// series can be placed in it.
+struct StreamLayout {
+    /// Season numbers that hold episodes.
+    seasons: std::collections::BTreeSet<i64>,
+    /// TMDB's season numbers that hold episodes in TMDB's numbering.
+    tmdb_seasons: std::collections::BTreeSet<i64>,
+    /// Every episode of the series, placed.
+    episodes: Vec<db::Media>,
+}
+
+/// With `seasons_by_stream_numbering` on, the episodes of `series` arranged
+/// by the season and episode numbers their Stremio ids carry (see
+/// [`add_stremio_ids`]): a series TMDB lists as one long season then shows
+/// the seasons stream addons and other apps know. TMDB stays the only source
+/// of episodes and their texts; only their places change. A series that
+/// can't be placed as a whole (see [`place_by_stream_numbers`]) comes back
+/// in TMDB's numbering.
+///
+/// `None` when the setting is off or the series has no IMDb id, and when a
+/// call failed for a series still in TMDB's numbering: its seasons are then
+/// listed one by one, as without the setting. For a series already arranged
+/// by stream numbers a failed call is an error instead, so that it is left
+/// alone until the next walk rather than flipping back and forth with an
+/// outage.
+async fn stream_layout(
+    series: &db::Media,
+    series_id: Uuid,
+    ctx: &AppContext,
+) -> Result<Option<Arc<StreamLayout>>> {
+    if !crate::db::Settings::get_config_or_default(&ctx.db)
+        .await
+        .seasons_by_stream_numbering
+    {
+        return Ok(None);
     }
+    let (Some(tmdb_id), true) = (
+        series
+            .external_ids
+            .tmdb,
+        series
+            .external_ids
+            .imdb
+            .is_some(),
+    ) else {
+        return Ok(None);
+    };
+    // The series' walk asks once for its seasons and once per season; kept
+    // for that long, so the whole series is fetched and placed once.
+    type Key = (String, i64, Uuid);
+    type Kept =
+        std::collections::HashMap<Key, (std::time::Instant, Option<Arc<StreamLayout>>)>;
+    static KEPT: std::sync::LazyLock<std::sync::Mutex<Kept>> =
+        std::sync::LazyLock::new(Default::default);
+    const KEEP: Duration = Duration::from_secs(600);
+    let key: Key = (
+        ctx.config
+            .tmdb_base_url
+            .clone(),
+        tmdb_id,
+        series_id,
+    );
+    if let Some((at, layout)) = KEPT
+        .lock()
+        .unwrap()
+        .get(&key)
+        && at.elapsed() < KEEP
+    {
+        return Ok(layout.clone());
+    }
+    let layout = fetch_stream_layout(series, series_id, tmdb_id, ctx)
+        .await?
+        .map(Arc::new);
+    let mut kept = KEPT
+        .lock()
+        .unwrap();
+    kept.retain(|_, (at, _)| at.elapsed() < KEEP);
+    kept.insert(key, (std::time::Instant::now(), layout.clone()));
+    Ok(layout)
+}
+
+async fn fetch_stream_layout(
+    series: &db::Media,
+    series_id: Uuid,
+    tmdb_id: i64,
+    ctx: &AppContext,
+) -> Result<Option<StreamLayout>> {
+    let incomplete = |what: &'static str| async move {
+        if arranged_by_stream_numbers(&ctx.db, series_id).await {
+            anyhow::bail!("stream numbering of series {tmdb_id} incomplete: {what}");
+        }
+        Ok(None)
+    };
+    if cinemeta_episodes(series, ctx)
+        .await
+        .is_none()
+    {
+        return incomplete("cinemeta").await;
+    }
+    let client = tmdb_client_from_ctx(ctx).await?;
+    let preferred_language = crate::db::Settings::get_config(&ctx.db)
+        .await
+        .ok()
+        .and_then(|c| c.preferred_metadata_language);
+    let tv = client
+        .execute(
+            sdks::tmdb::SeriesEndpoint::new(tmdb_id, preferred_language)
+                .with_cache(Duration::from_secs(360)),
+        )
+        .await?;
+    let fetched = futures::future::try_join_all(
+        tv.seasons
+            .iter()
+            .map(|s| tmdb_season_stubs(series, series_id, s.season_number, ctx)),
+    )
+    .await?;
+    if fetched
+        .iter()
+        .any(|(_, ids_complete)| !ids_complete)
+    {
+        return incomplete("episode ids").await;
+    }
+    let episodes: Vec<db::Media> = fetched
+        .into_iter()
+        .flat_map(|(episodes, _)| episodes)
+        .collect();
+    let tmdb_seasons = episodes
+        .iter()
+        .filter_map(|e| e.parent_idx)
+        .collect();
+    // A series that can't be placed is kept too, as TMDB numbers it: its
+    // seasons then read their episodes from here like a placed one's.
+    let episodes = place_by_stream_numbers(episodes, &series.series_canonical_key());
+    Ok(Some(StreamLayout {
+        seasons: episodes
+            .iter()
+            .filter_map(|e| e.parent_idx)
+            .collect(),
+        tmdb_seasons,
+        episodes,
+    }))
+}
+
+/// Whether a stored episode of the series sits at other numbers than TMDB's.
+async fn arranged_by_stream_numbers(db: &sqlx::SqlitePool, series_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM media WHERE kind = 'episode' AND grandparent_id = ? \
+         AND json_extract(external_ids, '$.tmdb_episode_number') IS NOT NULL \
+         AND json_extract(external_ids, '$.tmdb_episode_number') != parent_idx || ':' || idx \
+         LIMIT 1",
+    )
+    .bind(series_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .is_some()
+}
+
+/// Moves every regular episode to the season and episode number of its
+/// Stremio id, and gives it the id of that place. Specials (TMDB's season 0)
+/// stay as TMDB has them. An episode without a Stremio id, which is usually
+/// one TMDB already lists and Cinemeta not yet, follows the episode before it
+/// in its TMDB season. All or nothing: `None` when a regular episode can't be
+/// placed (no Stremio id and none before it to follow, or one that names a
+/// special) or two would share a place, the episodes come back as they are.
+fn place_by_stream_numbers(
+    mut episodes: Vec<db::Media>,
+    series_key: &str,
+) -> Vec<db::Media> {
+    episodes.sort_by_key(|e| (e.parent_idx, e.idx));
+    let Some(places) = stream_places(&episodes) else {
+        return episodes;
+    };
+    for (episode, place) in episodes
+        .iter_mut()
+        .zip(places)
+    {
+        let Some((season, number)) = place else {
+            continue;
+        };
+        episode.parent_idx = Some(season);
+        episode.idx = Some(number);
+        episode.id = db::Media::episode_id(series_key, season, number);
+        episode.parent_id = Some(db::Media::season_id(series_key, season));
+    }
+    episodes
+}
+
+/// The place of each regular episode in the stream numbering (`None` for a
+/// special, which stays), for episodes sorted by TMDB's numbers. `None` when
+/// the series can't be placed as a whole.
+fn stream_places(episodes: &[db::Media]) -> Option<Vec<Option<(i64, i64)>>> {
+    let mut places = Vec::with_capacity(episodes.len());
+    let mut taken = std::collections::HashSet::new();
+    // (TMDB season, place) of the episode before
+    let mut before: Option<(i64, (i64, i64))> = None;
+    for episode in episodes {
+        let tmdb_season = episode.parent_idx?;
+        if tmdb_season == 0 {
+            places.push(None);
+            continue;
+        }
+        let listed = episode
+            .external_ids
+            .custom_stremio_id
+            .as_deref()
+            .and_then(|id| {
+                let mut parts = id.rsplitn(3, ':');
+                let number = parts
+                    .next()?
+                    .parse()
+                    .ok()?;
+                let season = parts
+                    .next()?
+                    .parse()
+                    .ok()?;
+                Some((season, number))
+            });
+        let place: (i64, i64) = match (listed, before) {
+            (Some(place), _) => place,
+            (None, Some((season, (s, e)))) if season == tmdb_season => (s, e + 1),
+            _ => return None,
+        };
+        if place.0 < 1 || !taken.insert(place) {
+            return None;
+        }
+        before = Some((tmdb_season, place));
+        places.push(Some(place));
+    }
+    Some(places)
 }
 
 /// Gives each episode of a season its own TVDB and IMDb id. TMDB's season
@@ -801,7 +1120,8 @@ async fn add_episode_external_ids(
     series_tmdb_id: i64,
     season_number: i64,
     episodes: &mut [db::Media],
-) {
+) -> bool {
+    let mut complete = true;
     let numbers: Vec<i64> = episodes
         .iter()
         .filter_map(|e| e.idx)
@@ -826,6 +1146,7 @@ async fn add_episode_external_ids(
             Ok(batch) => batch,
             Err(e) => {
                 debug!(series_tmdb_id, season_number, error = %e, "episode external ids failed");
+                complete = false;
                 continue;
             }
         };
@@ -847,6 +1168,7 @@ async fn add_episode_external_ids(
                 .and_then(|s| db::NonEmptyString::try_new(s).ok());
         }
     }
+    complete
 }
 
 /// Cinemeta's episodes of `series`, by its IMDb id: TVDB's aired order,
@@ -1797,8 +2119,7 @@ async fn fetch_tmdb_meta(
         db::MediaKind::Episode => {
             let series_tmdb_id =
                 MediaResolveService::stored_series_tmdb_id(media, ctx).await?;
-            let season_number = media.parent_idx;
-            let episode_number = media.idx;
+            let (season_number, episode_number) = media.tmdb_episode_numbers();
             if let (Some(tmdb_id), Some(s_n), Some(e_n)) =
                 (series_tmdb_id, season_number, episode_number)
             {
@@ -1829,7 +2150,12 @@ async fn fetch_tmdb_meta(
                 else {
                     return Ok(None);
                 };
-                return Ok(Some(db::Media::from(ep)));
+                let mut patch = db::Media::from(ep);
+                // The row keeps its place: its numbers can be the stream
+                // numbering's (`seasons_by_stream_numbering`), not TMDB's.
+                patch.idx = media.idx;
+                patch.parent_idx = media.parent_idx;
+                return Ok(Some(patch));
             }
         }
         db::MediaKind::Season => {
@@ -2337,8 +2663,9 @@ async fn tmdb_remote_images(
         db::MediaKind::Episode => {
             let series_tmdb_id =
                 MediaResolveService::stored_series_tmdb_id(media, ctx).await?;
+            let (season_number, episode_number) = media.tmdb_episode_numbers();
             if let (Some(tmdb_id), Some(s_n), Some(e_n)) =
-                (series_tmdb_id, media.parent_idx, media.idx)
+                (series_tmdb_id, season_number, episode_number)
             {
                 let mut endpoint = sdks::tmdb::EpisodeEndpoint::new(
                     tmdb_id,
@@ -2459,6 +2786,72 @@ mod tests {
             ids,
             [Some("tt3121722:2:9"), None, Some("tt3121722:12:1"), None]
         );
+    }
+
+    /// A series TMDB lists as one long season (Re:Zero: 1x01-1x85) takes the
+    /// seasons its Stremio ids name. Specials stay, an episode Cinemeta
+    /// doesn't list yet follows the one before it, and a series that can't
+    /// be placed as a whole isn't placed at all.
+    #[test]
+    fn stream_numbering_places_a_whole_series_or_nothing() {
+        let episode = |season, idx, stremio: Option<&str>| db::Media {
+            kind: db::MediaKind::Episode,
+            parent_idx: Some(season),
+            idx: Some(idx),
+            external_ids: db::ExternalIds {
+                custom_stremio_id: stremio.map(str::to_string),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let placed = place_by_stream_numbers(
+            vec![
+                episode(1, 3, Some("tt1:2:1")),
+                episode(0, 1, Some("tt1:1:9")),
+                episode(1, 1, Some("tt1:1:1")),
+                episode(1, 2, Some("tt1:1:2")),
+                episode(1, 4, Some("tt1:2:2")),
+                episode(1, 5, None),
+            ],
+            "tt1",
+        );
+        let places: Vec<_> = placed
+            .iter()
+            .map(|e| {
+                (
+                    e.parent_idx
+                        .unwrap(),
+                    e.idx
+                        .unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(places, [(0, 1), (1, 1), (1, 2), (2, 1), (2, 2), (2, 3)]);
+        assert_eq!(placed[3].id, db::Media::episode_id("tt1", 2, 1));
+        assert_eq!(placed[3].parent_id, Some(db::Media::season_id("tt1", 2)));
+
+        let unplaceable = [
+            // nothing to follow
+            vec![episode(1, 1, None), episode(1, 2, Some("tt1:1:2"))],
+            // a new TMDB season doesn't follow the one before
+            vec![episode(1, 1, Some("tt1:1:1")), episode(2, 1, None)],
+            // a special in the stream numbering
+            vec![episode(1, 1, Some("tt1:0:3"))],
+            // two episodes at one place
+            vec![
+                episode(1, 1, Some("tt1:1:1")),
+                episode(1, 2, Some("tt1:1:1")),
+            ],
+            vec![
+                episode(1, 1, Some("tt1:1:2")),
+                episode(1, 2, None),
+                episode(1, 3, Some("tt1:1:3")),
+            ],
+        ];
+        for mut episodes in unplaceable {
+            episodes.sort_by_key(|e| (e.parent_idx, e.idx));
+            assert!(stream_places(&episodes).is_none());
+        }
     }
 
     #[test]
@@ -2779,6 +3172,166 @@ mod tests {
                     "status_message": "The resource you requested could not be found."
                 }));
         });
+    }
+
+    /// TMDB lists the show as one season of four episodes; stream addons
+    /// know it as two seasons of two, the first two in the other order.
+    /// With the setting on a refresh arranges it their way, with TMDB's
+    /// texts, and watch state follows its episode: to a new row (1x03 is
+    /// 2x01) and between rows that trade episodes (1x01 and 1x02). Off again,
+    /// the next refresh puts everything back.
+    #[tokio::test]
+    async fn seasons_by_stream_numbering_arranges_a_series_and_back() {
+        let tmdb = httpmock::MockServer::start();
+        let cinemeta = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/tv/9100");
+            let mut body = serde_json::json!({
+                "id": 9100,
+                "name": "Show",
+                "external_ids": { "imdb_id": "tt9100000", "tvdb_id": 9100 },
+                "seasons": [{ "id": 91, "season_number": 1, "name": "Season 1", "episode_count": 4 }]
+            });
+            for n in 1..=4 {
+                body[format!("season/1/episode/{n}/external_ids")] =
+                    serde_json::json!({ "tvdb_id": 9100 + n });
+            }
+            then.status(200)
+                .json_body(body);
+        });
+        tmdb.mock(|when, then| {
+            when.path("/tv/9100/season/1");
+            let episodes: Vec<_> = (1..=4)
+                .map(|n| {
+                    serde_json::json!({
+                        "id": 910 + n, "name": format!("Episode {n} of TMDB"), "overview": "Told.",
+                        "season_number": 1, "episode_number": n, "air_date": "2020-01-01"
+                    })
+                })
+                .collect();
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": 91, "name": "Season 1", "season_number": 1, "episodes": episodes
+                }));
+        });
+        cinemeta.mock(|when, then| {
+            when.path("/meta/series/tt9100000.json");
+            let video = |season: i64, episode: i64, tvdb: i64| {
+                serde_json::json!({
+                    "id": format!("tt9100000:{season}:{episode}"),
+                    "season": season, "episode": episode, "number": episode, "tvdb_id": tvdb
+                })
+            };
+            then.status(200)
+                .json_body(serde_json::json!({ "meta": {
+                    "id": "tt9100000",
+                    "videos": [video(1, 2, 9101), video(1, 1, 9102), video(2, 1, 9103), video(2, 2, 9104)]
+                }}));
+        });
+        let (_server, guard) =
+            crate::integration_test::new_test_server_with_config(crate::Config {
+                database_url: Some("sqlite::memory:".into()),
+                torrent_http_port: None,
+                disable_dht: true,
+                tmdb_base_url: tmdb.base_url(),
+                cinemeta_base_url: cinemeta.base_url(),
+                disable_startup_tasks: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let set = |on: bool| async move {
+            let mut config = db::Settings::get_config_or_default(&ctx.db).await;
+            // A busy test run must not turn a slow answer into a fallback.
+            config.addon_fetch_timeout_secs = Some(60);
+            config.seasons_by_stream_numbering = on;
+            db::Settings::set_config(&ctx.db, &config)
+                .await
+                .unwrap();
+        };
+        let mut series = db::Media {
+            id: Uuid::new_v4(),
+            kind: db::MediaKind::Series,
+            title: "Show".into(),
+            external_ids: db::ExternalIds {
+                tmdb: Some(9100),
+                imdb: db::NonEmptyString::try_new("tt9100000").ok(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        series
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        let user = Uuid::new_v4();
+        // (season, episode, TMDB episode id, title, watched) of every episode
+        let refreshed = || async {
+            let stored = db::Media::get_by_id(&ctx.db, &series.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let series_id = ctx
+                .addons
+                .process_meta_batch(vec![stored], ctx, true, None)
+                .await
+                .unwrap()[&series.id];
+            sqlx::query_as::<_, (i64, i64, i64, String, bool)>(
+                "SELECT parent_idx, idx, json_extract(external_ids, '$.tmdb'), title, \
+                 EXISTS (SELECT 1 FROM user_media_state s WHERE s.media_id = media.id AND s.user_id = ?) \
+                 FROM media WHERE grandparent_id = ? AND kind = 'episode' ORDER BY parent_idx, idx",
+            )
+            .bind(user)
+            .bind(series_id)
+            .fetch_all(&ctx.db)
+            .await
+            .unwrap()
+        };
+        let episode = |s: i64, e: i64, tmdb: i64, watched: bool| {
+            (s, e, 910 + tmdb, format!("Episode {tmdb} of TMDB"), watched)
+        };
+
+        set(false).await;
+        assert_eq!(
+            refreshed().await,
+            [
+                episode(1, 1, 1, false),
+                episode(1, 2, 2, false),
+                episode(1, 3, 3, false),
+                episode(1, 4, 4, false),
+            ]
+        );
+        // TMDB's first and third episode are watched.
+        sqlx::query(
+            "INSERT INTO user_media_state (user_id, media_id, play_count, playback_position) \
+             SELECT ?, id, 1, 0 FROM media WHERE kind = 'episode' \
+             AND json_extract(external_ids, '$.tmdb') IN (911, 913)",
+        )
+        .bind(user)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+        let by_tmdb = [
+            episode(1, 1, 1, true),
+            episode(1, 2, 2, false),
+            episode(1, 3, 3, true),
+            episode(1, 4, 4, false),
+        ];
+        assert_eq!(refreshed().await, by_tmdb);
+
+        set(true).await;
+        let by_streams = [
+            episode(1, 1, 2, false),
+            episode(1, 2, 1, true),
+            episode(2, 1, 3, true),
+            episode(2, 2, 4, false),
+        ];
+        assert_eq!(refreshed().await, by_streams);
+        assert_eq!(refreshed().await, by_streams);
+
+        set(false).await;
+        assert_eq!(refreshed().await, by_tmdb);
     }
 
     /// TMDB answers 404 for an entry it merged into another one, but `/find`

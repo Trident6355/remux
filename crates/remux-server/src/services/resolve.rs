@@ -399,7 +399,7 @@ impl MediaResolveService {
                     .tmdb = Some(episode_tmdb);
                 series_tmdb
             };
-            let (Some(season), Some(episode)) = (media.parent_idx, media.idx) else {
+            let (Some(season), Some(episode)) = media.tmdb_episode_numbers() else {
                 return;
             };
             let Ok(Some(ids)) =
@@ -717,9 +717,10 @@ impl MediaResolveService {
             return Ok(changed);
         }
 
+        let (tmdb_season, tmdb_number) = episode.tmdb_episode_numbers();
         let (Some(season), Some(number), Some(series_tmdb)) = (
-            episode.parent_idx,
-            episode.idx,
+            tmdb_season,
+            tmdb_number,
             series
                 .external_ids
                 .tmdb,
