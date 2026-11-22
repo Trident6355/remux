@@ -1,5 +1,6 @@
 # PRs von lostb1t/remux, die das Image zusätzlich zum Release enthält (eine Nummer je Zeile, Rest ist Kommentar).
-# Was schon im Release steckt, überspringt der Workflow von selbst.
+# Was schon im Release steckt, überspringt der Workflow von selbst. branch=<Zweig> nimmt statt des PR-Kopfs einen an
+# das Release angepassten Zweig dieses Forks (fällt weg, sobald der PR im Release ist).
 649  OpenID-Connect-Anmeldung
-704  Listen des genannten Kontos bei Admin/API-Schlüssel (ersetzt #703)
+704  branch=oidc-image/pr704  Listen des genannten Kontos bei Admin/API-Schlüssel (ersetzt #703)
 725  Staffel sichtbar, sobald eine Folge erschienen ist
