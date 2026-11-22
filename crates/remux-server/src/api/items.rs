@@ -2343,8 +2343,7 @@ pub async fn item_for_user(
                     &mut item,
                     &state.ctx,
                     Some(
-                        session
-                            .user
+                        user
                             .id,
                     ),
                 )
@@ -2377,8 +2376,7 @@ pub async fn item_for_user(
                     start,
                     &sidecars,
                     media.id,
-                    session
-                        .device
+                    device
                         .access_token
                         .expose(),
                 );
