@@ -430,13 +430,15 @@ impl AddonKind for OpendalAddon {
             types: vec![],
             id_prefixes: None,
         };
-        Ok(Some((
-            vec![
-                make_ref(ResourceType::Stream),
-                make_ref(ResourceType::Catalog),
-            ],
-            vec![media_type],
-        )))
+        let mut resources = vec![
+            make_ref(ResourceType::Stream),
+            make_ref(ResourceType::Catalog),
+        ];
+        // The subtitle files next to the videos (see `SubtitleAddon::supports`).
+        if matches!(self.media_kind, OpendalKind::Movie | OpendalKind::Episode) {
+            resources.push(make_ref(ResourceType::Subtitles));
+        }
+        Ok(Some((resources, vec![media_type])))
     }
 }
 
@@ -671,6 +673,10 @@ impl IndexAddon for OpendalAddon {
 
 #[async_trait]
 impl SubtitleAddon for OpendalAddon {
+    fn is_local(&self) -> bool {
+        true
+    }
+
     fn supports(&self, media: &db::Media) -> bool {
         match self.media_kind {
             OpendalKind::Movie => {
