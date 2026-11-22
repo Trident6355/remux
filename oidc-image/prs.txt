@@ -1,0 +1,5 @@
+# PRs von lostb1t/remux, die das Image zusätzlich zum Release enthält (eine Nummer je Zeile, Rest ist Kommentar).
+# Was schon im Release steckt, überspringt der Workflow von selbst. Ziel: am Ende nur noch #649.
+649  OIDC-Anmeldung (Pocket ID), fremder PR, offen
+704  Listen des genannten Kontos bei Admin/API-Schlüssel (Maintainer-PR, ersetzt #703; nötig für die Brücke)
+725  Staffel sichtbar, sobald eine Folge erschienen ist (sonst One Piece 6 von 24 Staffeln)
