@@ -1,0 +1,171 @@
+# Remux mit OIDC (lostb1t/remux#649) als Docker-Image, automatisch zu jedem neuen Remux-Release.
+#
+# Ablauf: neuestes Release von lostb1t/remux holen -> PRs aus oidc-image/prs.txt darauflegen (was schon im Release
+# steckt, wird übersprungen) -> Tests -> Server und Dashboard bauen -> auf das offizielle Release-Image legen ->
+# Start-Test -> veröffentlichen als ghcr.io/trident6355/remux:<version>-oidc und :oidc.
+# Konflikt, ohne Merge geschlossener PR, roter Test oder misslungener Start: nichts wird veröffentlicht, der Lauf
+# schlägt fehl (GitHub meldet das per Mail), Server bleiben auf dem letzten guten Image.
+name: Remux mit OIDC bauen
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Remux-Release, z. B. 0.42.0 (leer = neuestes)
+        required: false
+        default: ""
+      force:
+        description: Auch bauen, wenn das Image schon existiert
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: oidc-image
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: lostb1t/remux
+  IMAGE: ghcr.io/trident6355/remux
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Konfiguration holen
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Release bestimmen
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          v="${{ inputs.version }}"
+          [ -n "$v" ] || v=$(gh release view --repo "$UPSTREAM" --json tagName -q .tagName)
+          v="${v#v}"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          if [ "${{ inputs.force }}" != "true" ] && docker manifest inspect "$IMAGE:$v-oidc" >/dev/null 2>&1; then
+            echo "Image $IMAGE:$v-oidc gibt es schon, nichts zu tun."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Release + PRs zusammenführen
+        if: steps.plan.outputs.build == 'true'
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none --branch "v$V" "https://github.com/$UPSTREAM.git" src
+          cd src
+          git config user.name "oidc-image"
+          git config user.email "oidc-image@users.noreply.github.com"
+          applied=""
+          for p in $(grep -oE '^[0-9]+' ../ci/oidc-image/prs.txt); do
+            git fetch -q origin "pull/$p/head:pr-$p"
+            if git merge-base --is-ancestor "pr-$p" "v$V"; then
+              echo "PR #$p ist in v$V enthalten: übersprungen"; continue
+            fi
+            state=$(gh pr view "$p" --repo "$UPSTREAM" --json state -q .state)
+            if [ "$state" = "CLOSED" ]; then
+              echo "::error::PR #$p wurde ohne Merge geschlossen. prs.txt prüfen (Ersatz-PR?), dann neu starten."; exit 1
+            fi
+            if ! git merge -q --no-ff --no-edit -m "oidc-image: v$V + PR #$p" "pr-$p"; then
+              echo "::error::Merge-Konflikt bei PR #$p auf v$V. Nichts veröffentlicht."; git merge --abort; exit 1
+            fi
+            echo "PR #$p ($(git rev-parse --short "pr-$p")) zusammengeführt"; applied="$applied #$p"
+          done
+          echo "applied=${applied# }" >> "$GITHUB_OUTPUT"
+          sed -i "0,/^version = \".*\"/s//version = \"$V+oidc\"/" crates/remux-server/Cargo.toml
+          grep -oE "dioxus-cli@[0-9.]+" .github/workflows/build.yml | head -1 > ../dioxus-version
+
+      - name: Rust einrichten
+        if: steps.plan.outputs.build == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cargo-Cache
+        if: steps.plan.outputs.build == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+
+      - name: Tests (OIDC, Konten, Staffeln)
+        if: steps.plan.outputs.build == 'true'
+        working-directory: src
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends pkg-config libssl-dev >/dev/null
+          cargo test --release -p remux-server -- sso oidc web_patches users season
+
+      - name: Server bauen
+        if: steps.plan.outputs.build == 'true'
+        working-directory: src
+        env:
+          SQLX_OFFLINE: "true"
+          CFLAGS_x86_64_unknown_linux_gnu: "-march=x86-64 -mtune=generic"
+        run: cargo build --release -p remux-server
+
+      - name: Dashboard bauen
+        if: steps.plan.outputs.build == 'true'
+        working-directory: src
+        run: |
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall "$(cat ../dioxus-version)" --no-confirm --force --locked
+          cd crates/remux-dashboard && ~/.cargo/bin/dx build --release
+
+      - name: Image bauen und testen
+        if: steps.plan.outputs.build == 'true'
+        env:
+          V: ${{ steps.plan.outputs.version }}
+          APPLIED: ${{ steps.merge.outputs.applied }}
+        run: |
+          set -euo pipefail
+          mkdir ctx
+          cp src/target/release/remux-server ctx/
+          cp -r src/target/dx/remux-dashboard/release/web/public ctx/dashboard
+          cat > ctx/Dockerfile <<EOF
+          FROM ghcr.io/lostb1t/remux:$V
+          COPY --chmod=755 remux-server /app/remux-server
+          RUN rm -rf /app/dashboard
+          COPY dashboard /app/dashboard
+          LABEL org.opencontainers.image.source="https://github.com/Trident6355/remux" \
+                org.opencontainers.image.description="Remux $V + PRs: $APPLIED (gebaut von oidc-image.yml)" \
+                org.opencontainers.image.version="$V-oidc"
+          EOF
+          docker build -q -t "$IMAGE:$V-oidc" ctx
+          docker run -d --name smoke -p 3000:3000 "$IMAGE:$V-oidc"
+          for i in $(seq 1 60); do
+            info=$(curl -fs http://127.0.0.1:3000/System/Info/Public || true)
+            [ -n "$info" ] && break; sleep 2
+          done
+          echo "$info"
+          echo "$info" | grep -q "\"RemuxVersion\":\"$V+oidc\"" || { docker logs smoke | tail -50; echo "::error::Start-Test fehlgeschlagen"; exit 1; }
+          curl -fs -o /dev/null http://127.0.0.1:3000/web/ || { echo "::error::Weboberfläche fehlt"; exit 1; }
+          docker rm -f smoke >/dev/null
+
+      - name: Veröffentlichen
+        if: steps.plan.outputs.build == 'true'
+        env:
+          V: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker tag "$IMAGE:$V-oidc" "$IMAGE:oidc"
+          docker push -q "$IMAGE:$V-oidc"
+          docker push -q "$IMAGE:oidc"
+          echo "### Veröffentlicht: \`$IMAGE:$V-oidc\` (PRs: ${{ steps.merge.outputs.applied }})" >> "$GITHUB_STEP_SUMMARY"
