@@ -24,6 +24,7 @@ on:
 permissions:
   contents: read
   packages: write
+  actions: write   # nur für die Selbst-Erneuerung unten (GitHub schaltet Zeitpläne nach 60 Tagen ohne Aktivität ab)
 
 concurrency:
   group: oidc-image
@@ -89,6 +90,27 @@ jobs:
             echo "PR #$p ($(git rev-parse --short "pr-$p")) zusammengeführt"; applied="$applied #$p"
           done
           echo "applied=${applied# }" >> "$GITHUB_OUTPUT"
+          # Häufigster Merge-Rest: eine Abhängigkeit, die Release und PR beide ergänzt haben, steht doppelt in einer
+          # Cargo.toml (z. B. sha2). Identische Zeilen im selben Abschnitt werden entfernt, abweichende brechen ab.
+          python3 - <<'PY'
+          import glob, re, sys
+          for path in glob.glob("Cargo.toml") + glob.glob("crates/*/Cargo.toml"):
+              out, seen, section, changed = [], {}, None, False
+              for line in open(path).read().splitlines(keepends=True):
+                  if line.startswith("["):
+                      section, seen = line.strip(), {}
+                  m = re.match(r"^([A-Za-z0-9_-]+)\s*=", line)
+                  if m and section:
+                      key = m.group(1)
+                      if key in seen:
+                          if seen[key].strip() == line.strip():
+                              print(f"{path} {section}: doppelte Zeile entfernt: {line.strip()}"); changed = True; continue
+                          sys.exit(f"::error::{path} {section}: '{key}' doppelt mit verschiedenen Werten")
+                      seen[key] = line
+                  out.append(line)
+              if changed:
+                  open(path, "w").write("".join(out))
+          PY
           sed -i "0,/^version = \".*\"/s//version = \"$V+oidc\"/" crates/remux-server/Cargo.toml
           grep -oE "dioxus-cli@[0-9.]+" .github/workflows/build.yml | head -1 > ../dioxus-version
 
@@ -169,3 +191,9 @@ jobs:
           docker push -q "$IMAGE:$V-oidc"
           docker push -q "$IMAGE:oidc"
           echo "### Veröffentlicht: \`$IMAGE:$V-oidc\` (PRs: ${{ steps.merge.outputs.applied }})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Zeitplan aktiv halten
+        if: always() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/oidc-image.yml/enable" || true
