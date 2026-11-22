@@ -75,7 +75,10 @@ jobs:
           git config user.name "oidc-image"
           git config user.email "oidc-image@users.noreply.github.com"
           applied=""
-          for p in $(grep -oE '^[0-9]+' ../ci/oidc-image/prs.txt); do
+          # Zeile: "<PR-Nummer> [branch=<Zweig im Fork>] Kommentar". Mit branch= wird statt des PR-Kopfs ein an das
+          # Release angepasster Zweig aus diesem Fork genommen; ob der PR schon im Release steckt, zählt weiter am PR.
+          while read -r p rest; do
+            case "$p" in ''|\#*) continue;; esac
             git fetch -q origin "pull/$p/head:pr-$p"
             if git merge-base --is-ancestor "pr-$p" "v$V"; then
               echo "PR #$p ist in v$V enthalten: übersprungen"; continue
@@ -84,11 +87,16 @@ jobs:
             if [ "$state" = "CLOSED" ]; then
               echo "::error::PR #$p wurde ohne Merge geschlossen. prs.txt prüfen (Ersatz-PR?), dann neu starten."; exit 1
             fi
-            if ! git merge -q --no-ff --no-edit -m "oidc-image: v$V + PR #$p" "pr-$p"; then
-              echo "::error::Merge-Konflikt bei PR #$p auf v$V. Nichts veröffentlicht."; git merge --abort; exit 1
+            src="pr-$p"
+            branch=$(echo "$rest" | grep -oE 'branch=[^ ]+' | cut -d= -f2 || true)
+            if [ -n "$branch" ]; then
+              git fetch -q "https://github.com/${{ github.repository }}.git" "$branch:fix-$p"; src="fix-$p"
             fi
-            echo "PR #$p ($(git rev-parse --short "pr-$p")) zusammengeführt"; applied="$applied #$p"
-          done
+            if ! git merge -q --no-ff --no-edit -m "oidc-image: v$V + PR #$p" "$src"; then
+              echo "::error::Merge-Konflikt bei PR #$p ($src) auf v$V. Nichts veröffentlicht."; git merge --abort; exit 1
+            fi
+            echo "PR #$p ($src $(git rev-parse --short "$src")) zusammengeführt"; applied="$applied #$p"
+          done < ../ci/oidc-image/prs.txt
           echo "applied=${applied# }" >> "$GITHUB_OUTPUT"
           # Häufigster Merge-Rest: eine Abhängigkeit, die Release und PR beide ergänzt haben, steht doppelt in einer
           # Cargo.toml (z. B. sha2). Identische Zeilen im selben Abschnitt werden entfernt, abweichende brechen ab.
