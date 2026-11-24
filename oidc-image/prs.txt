@@ -4,3 +4,4 @@
 649  OpenID-Connect-Anmeldung
 704  branch=oidc-image/pr704  Listen des genannten Kontos bei Admin/API-Schlüssel (ersetzt #703)
 725  Staffel sichtbar, sobald eine Folge erschienen ist
+740  Medieninfo zeigt echte Quellen (späteres getItem ohne Fields)
